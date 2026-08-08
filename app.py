@@ -8,36 +8,39 @@ from docx.oxml import parse_xml
 from docx.oxml.ns import nsdecls
 from groq import Groq
 import streamlit as st
-import chromadb
-from chromadb.utils import embedding_functions
+from pinecone import Pinecone, ServerlessSpec
 
 # =====================================================================
-# 1. APPLICATION SETUP & PERMANENT MEMORY (LOCAL DISK PERSISTENCE)
+# 1. APPLICATION SETUP & PINECONE CLOUD VECTOR DB
 # =====================================================================
 st.set_page_config(
-    page_title="Fast Project Finance AI Legal Redliner",
+    page_title="Cloud Project Finance AI Legal Redliner",
     page_icon="⚡",
     layout="wide",
 )
 
-PERSIST_DIR = os.path.abspath(os.path.join(os.getcwd(), "chroma_permanent_db"))
-os.makedirs(PERSIST_DIR, exist_ok=True)
+INDEX_NAME = "project-finance-playbook"
+EMBED_MODEL = "multilingual-e5-large"  # Pinecone hosted embedding model (1024 dims)
 
 @st.cache_resource
-def get_chroma_client():
-    """Initializes and caches the persistent ChromaDB client pointing to local disk storage."""
-    return chromadb.PersistentClient(path=PERSIST_DIR)
-
-def get_collection():
-    """Retrieves or creates the collection from the persistent disk client."""
-    client = get_chroma_client()
-    emb_fn = embedding_functions.DefaultEmbeddingFunction()
-    collection = client.get_or_create_collection(
-        name="hybrid_repository_playbook",
-        embedding_function=emb_fn,
-        metadata={"hnsw:space": "cosine"}
-    )
-    return collection
+def init_pinecone(api_key):
+    """Initializes Pinecone client and ensures serverless index exists."""
+    if not api_key:
+        return None, None
+    pc = Pinecone(api_key=api_key)
+    
+    # Create index if it doesn't exist
+    existing_indexes = [idx.name for idx in pc.list_indexes()]
+    if INDEX_NAME not in existing_indexes:
+        pc.create_index(
+            name=INDEX_NAME,
+            dimension=1024,
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1")
+        )
+    
+    index = pc.Index(INDEX_NAME)
+    return pc, index
 
 # =====================================================================
 # 2. WORD DOCUMENT PARSING & WORD-BY-WORD TRACK CHANGES GENERATOR
@@ -55,7 +58,6 @@ def extract_paragraphs_from_docx(docx_file):
 def create_redlined_docx(paragraph_pairs, author="AI Legal Agent"):
     """
     Generates DOCX with native track changes at the word level using difflib.
-    Shows surgical inline deletions and insertions rather than full sentence replacements.
     """
     doc = Document()
     
@@ -121,37 +123,53 @@ def create_redlined_docx(paragraph_pairs, author="AI Legal Agent"):
     return output_path
 
 # =====================================================================
-# 3. HIGH-SPEED VECTOR RETRIEVAL & DUAL-KEY LLM ANALYSIS ENGINE
+# 3. CLOUD VECTOR RETRIEVAL & LLM ENGINE
 # =====================================================================
 
-def batch_query_worker(collection, chunk_paras, chunk_start_idx):
-    """Executes a single ChromaDB query batch on a thread without UI code."""
-    matches = collection.query(
-        query_texts=chunk_paras,
-        n_results=1,
-        include=["documents", "metadatas"]
-    )
-    
-    batch_results = []
-    for idx, p_text in enumerate(chunk_paras):
-        ctx = "NO DIRECT REPOSITORY PRECEDENT FOUND."
-        if matches and matches.get("documents") and matches["documents"][idx]:
-            doc_str = matches["documents"][idx][0]
-            src = matches["metadatas"][idx][0].get("source", "Repo")
-            ctx = f"Precedent from [{src}]: \"{doc_str}\""
+def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
+    """Generates embeddings using Pinecone Hosted Inference and queries cloud vectors."""
+    try:
+        # Generate embeddings using Pinecone Inference API
+        embeddings = pc.inference.embed(
+            model=EMBED_MODEL,
+            inputs=chunk_paras,
+            parameters={"input_type": "query"}
+        )
         
-        batch_results.append({
+        batch_results = []
+        for idx, (p_text, emb) in enumerate(zip(chunk_paras, embeddings)):
+            res = index.query(
+                vector=emb["values"],
+                top_k=1,
+                include_metadata=True
+            )
+            
+            ctx = "NO DIRECT REPOSITORY PRECEDENT FOUND."
+            if res.get("matches") and len(res["matches"]) > 0:
+                match = res["matches"][0]
+                if match["score"] > 0.65:  # Relevance threshold
+                    doc_str = match["metadata"].get("text", "")
+                    src = match["metadata"].get("source", "Repo")
+                    ctx = f"Precedent from [{src}]: \"{doc_str}\""
+            
+            batch_results.append({
+                "id": chunk_start_idx + idx,
+                "clause": p_text,
+                "context": ctx
+            })
+        return batch_results, len(chunk_paras)
+    except Exception as e:
+        print(f"❌ Pinecone Query Error: {e}", flush=True)
+        # Fallback empty context
+        return [{
             "id": chunk_start_idx + idx,
             "clause": p_text,
-            "context": ctx
-        })
-    return batch_results, len(chunk_paras)
+            "context": "NO DIRECT REPOSITORY PRECEDENT FOUND."
+        } for idx, p_text in enumerate(chunk_paras)], len(chunk_paras)
 
 
-def run_fast_parallel_retrieval(collection, paragraphs, batch_size=25, max_workers=4, status_placeholder=None, progress_bar=None, log_area=None, logs_list=None):
-    """
-    Executes parallel retrieval and safely updates Streamlit UI on the MAIN thread as futures resolve.
-    """
+def run_parallel_pinecone_retrieval(pc, index, paragraphs, batch_size=15, max_workers=4, status_placeholder=None, progress_bar=None, log_area=None, logs_list=None):
+    """Executes parallel retrieval against Pinecone Cloud DB."""
     total = len(paragraphs)
     prepared_items = [None] * total
     
@@ -166,7 +184,7 @@ def run_fast_parallel_retrieval(collection, paragraphs, batch_size=25, max_worke
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(batch_query_worker, collection, chunk, start_idx): (chunk, start_idx)
+            executor.submit(query_pinecone_batch, pc, index, chunk, start_idx): (chunk, start_idx)
             for chunk, start_idx in chunks
         }
         
@@ -178,14 +196,13 @@ def run_fast_parallel_retrieval(collection, paragraphs, batch_size=25, max_worke
             for item in batch_data:
                 prepared_items[item["id"]] = item
 
-            # Update Streamlit UI safely from the MAIN thread
             if status_placeholder and progress_bar:
                 pct = int((completed_clauses / total) * 20)
                 progress_bar.progress(pct)
-                status_placeholder.text(f"🔍 Parallel Search: Processed {completed_clauses}/{total} clauses ({completed_chunks}/{total_chunks} thread batches)...")
+                status_placeholder.text(f"🔍 Pinecone Cloud Search: {completed_clauses}/{total} clauses ({completed_chunks}/{total_chunks} batches)...")
                 
             if log_area and logs_list is not None:
-                log_msg = f"[{time.strftime('%H:%M:%S')}] 🧵 Thread Batch {completed_chunks}/{total_chunks} retrieved ({completed_clauses}/{total} clauses)"
+                log_msg = f"[{time.strftime('%H:%M:%S')}] ☁️ Cloud Batch {completed_chunks}/{total_chunks} retrieved ({completed_clauses}/{total} clauses)"
                 logs_list.append(log_msg)
                 log_area.text("\n".join(logs_list[-12:]))
 
@@ -193,9 +210,7 @@ def run_fast_parallel_retrieval(collection, paragraphs, batch_size=25, max_worke
 
 
 def analyze_clause_batch(batch_items, custom_instruction, primary_key, secondary_key, model_strategy):
-    """
-    Analyzes clause batches using dual API key load balancing and backoff.
-    """
+    """Analyzes clause batches using Groq LLM with dual-key failover and exponential backoff."""
     api_keys = [k for k in [primary_key, secondary_key] if k and k.strip()]
     if not api_keys:
         return []
@@ -262,7 +277,7 @@ def analyze_clause_batch(batch_items, custom_instruction, primary_key, secondary
         client = Groq(api_key=current_key)
         
         for model_name in models_to_try:
-            for attempt in range(5):  # Up to 5 retries with exponential pause
+            for attempt in range(3):
                 try:
                     response = client.chat.completions.create(
                         model=model_name,
@@ -281,9 +296,9 @@ def analyze_clause_batch(batch_items, custom_instruction, primary_key, secondary
                     if "429" in err_msg or "rate_limit_exceeded" in err_msg:
                         if len(api_keys) > 1 and key_idx == 0:
                             print(f"⚠️ [Key 1 Rate Limit on {model_name}]: Switching to Secondary Key...", flush=True)
-                            break  # Move to key 2 immediately
+                            break
                         else:
-                            wait_time = (attempt + 1) * 5  # Pauses for 5s, 10s, 15s, 20s, 25s
+                            wait_time = (attempt + 1) * 4
                             print(f"⚠️ [Rate Limit Hit on {model_name}]: Retrying in {wait_time}s...", flush=True)
                             time.sleep(wait_time)
                             continue
@@ -292,14 +307,13 @@ def analyze_clause_batch(batch_items, custom_instruction, primary_key, secondary
                         time.sleep(2)
                         break
 
-    # Fallback if both keys and retries fail
     fallback_results = []
     for item in batch_items:
         fallback_results.append({
             "id": item["id"],
             "is_acceptable": True,
             "proposed_text": item["clause"],
-            "explanation": "Skipped due to API rate limit limits."
+            "explanation": "Skipped due to API rate limits."
         })
     return fallback_results
 
@@ -307,17 +321,18 @@ def analyze_clause_batch(batch_items, custom_instruction, primary_key, secondary
 # 4. STREAMLIT UI & TABBED INTERFACE
 # =====================================================================
 
-st.title("⚡ Project Finance AI Legal Agent (Persistent Memory)")
-st.caption("Surgical Legal Redliner with Multi-Threaded Retrieval & Dual-Key Load Balancing")
+st.title("☁️ Project Finance AI Legal Agent (Pinecone Cloud)")
+st.caption("Surgical Redliner backed by Pinecone Serverless Vector Database & Groq")
+
+# Read Secrets if available (Streamlit Cloud Secrets)
+default_groq = st.secrets.get("GROQ_API_KEY", "") if "GROQ_API_KEY" in st.secrets else ""
+default_pinecone = st.secrets.get("PINECONE_API_KEY", "") if "PINECONE_API_KEY" in st.secrets else ""
 
 with st.sidebar:
-    st.header("🔑 Configuration")
-    primary_api_key = st.text_input("Primary Groq API Key", type="password")
-    secondary_api_key = st.text_input(
-        "Secondary Groq API Key (Optional Backup)", 
-        type="password", 
-        help="Adding a 2nd key doubles your rate limits and prevents rate-limit hangs."
-    )
+    st.header("🔑 Credentials")
+    pinecone_api_key = st.text_input("Pinecone API Key", value=default_pinecone, type="password")
+    primary_api_key = st.text_input("Primary Groq API Key", value=default_groq, type="password")
+    secondary_api_key = st.text_input("Secondary Groq API Key (Optional)", type="password")
     
     st.divider()
     st.header("⚙️ Model Strategy")
@@ -327,53 +342,48 @@ with st.sidebar:
             "Fastest & Highest Limit (llama-3.1-8b-instant)", 
             "High Accuracy (llama-3.3-70b-versatile with 8b Fallback)"
         ],
-        index=0,
-        help="Selecting 8B Instant directly avoids 70B daily quota blocks."
+        index=0
     )
     
     st.divider()
-    st.header("🗄️ Permanent Repository")
+    st.header("☁️ Cloud Vector Storage")
     
-    current_count = get_collection().count()
-    st.metric("Indexed Clauses Saved on Disk", current_count)
-    st.caption(f"💾 Storage Path:\n`{PERSIST_DIR}`")
-    
-    if st.button("🔄 Refresh Count"):
-        st.rerun()
-        
-    if st.button("🗑️ Clear Permanent Memory", type="secondary"):
-        client = get_chroma_client()
-        client.delete_collection("hybrid_repository_playbook")
-        st.success("Disk memory erased!")
-        st.rerun()
+    pc_client, pc_index = init_pinecone(pinecone_api_key)
+    if pc_index:
+        try:
+            stats = pc_index.describe_index_stats()
+            vector_count = stats.get("total_vector_count", 0)
+            st.metric("Cloud Index Vector Count", vector_count)
+        except Exception:
+            st.caption("Unable to fetch stats.")
+            
+        if st.button("🗑️ Clear Cloud Memory"):
+            pc_index.delete(delete_all=True)
+            st.success("Cloud database erased!")
+            st.rerun()
 
 tab_redline, tab_repository, tab_chat = st.tabs([
     "🚀 High-Speed Redliner", 
-    "📚 Upload Repository Precedents", 
+    "📚 Upload Cloud Precedents", 
     "💬 Smart Chat Assistant"
 ])
 
 # ---------------------------------------------------------------------
-# TAB 1: HIGH-SPEED SURGICAL REDLINER
+# TAB 1: REDLINER
 # ---------------------------------------------------------------------
 with tab_redline:
     st.header("Analyze & Redline Facility Agreement")
     
     uploaded_draft = st.file_uploader("Upload New Document (.docx)", type=["docx"], key="target_doc")
-    
-    custom_instruction = st.text_area(
-        "Optional Deal Directives / Overrides",
-        placeholder="e.g., 'Ensure minimum DSCR covenant is set to 1.25x'."
-    )
+    custom_instruction = st.text_area("Optional Deal Directives / Overrides", placeholder="e.g., 'Ensure minimum DSCR covenant is set to 1.25x'.")
     
     if st.button("⚡ Fast Batch Redline Document", type="primary"):
-        collection = get_collection()
         if not primary_api_key:
-            st.error("Please enter at least your Primary Groq API Key in the sidebar.")
+            st.error("Please enter your Primary Groq API Key.")
+        elif not pinecone_api_key:
+            st.error("Please enter your Pinecone API Key.")
         elif not uploaded_draft:
             st.error("Please upload a .docx document.")
-        elif collection.count() == 0:
-            st.warning("Your permanent repository on disk is empty. Upload precedents in Tab 2 first.")
         else:
             paragraphs = extract_paragraphs_from_docx(uploaded_draft)
             total_paragraphs = len(paragraphs)
@@ -383,22 +393,20 @@ with tab_redline:
             progress_bar = st.progress(0)
             status_placeholder = st.empty()
             
-            debug_box = st.expander("🔍 Live Batch Processing Logs", expanded=True)
+            debug_box = st.expander("🔍 Live Processing Logs", expanded=True)
             log_area = debug_box.empty()
             logs = []
 
-            print(f"\n================ STARTING REDLINE PROCESS ({total_paragraphs} Clauses) ================", flush=True)
-            
-            # STEP 1: Multi-Threaded Local Vector Search (Main thread handles UI updates)
-            logs.append(f"[{time.strftime('%H:%M:%S')}] ⚡ Launching 4 CPU threads for vector retrieval...")
+            # STEP 1: Pinecone Cloud Vector Search
+            logs.append(f"[{time.strftime('%H:%M:%S')}] ☁️ Querying Pinecone Serverless Cloud Database...")
             log_area.text("\n".join(logs))
-            status_placeholder.text("Running thread-safe disk vector search...")
             
             vec_start = time.time()
-            prepared_items = run_fast_parallel_retrieval(
-                collection=collection, 
+            prepared_items = run_parallel_pinecone_retrieval(
+                pc=pc_client,
+                index=pc_index, 
                 paragraphs=paragraphs, 
-                batch_size=25, 
+                batch_size=15, 
                 max_workers=4,
                 status_placeholder=status_placeholder,
                 progress_bar=progress_bar,
@@ -408,11 +416,11 @@ with tab_redline:
             vec_elapsed = round(time.time() - vec_start, 2)
             
             progress_bar.progress(20)
-            logs.append(f"[{time.strftime('%H:%M:%S')}] ✅ Vector search complete in {vec_elapsed}s! Beginning LLM analysis...")
+            logs.append(f"[{time.strftime('%H:%M:%S')}] ✅ Pinecone cloud lookup finished in {vec_elapsed}s! Starting LLM analysis...")
             log_area.text("\n".join(logs[-12:]))
 
-            # STEP 2: Batched LLM Analysis with Throttle Pace
-            BATCH_SIZE = 10  # 10 clauses per batch balances tokens and requests per minute
+            # STEP 2: Batched LLM Analysis
+            BATCH_SIZE = 10
             redline_results = []
             total_items = len(prepared_items)
             
@@ -443,8 +451,7 @@ with tab_redline:
                         res.get("is_acceptable", True)
                     ))
                 
-                # Small 0.5s pause between API batches to keep RPM under control
-                time.sleep(0.5)
+                time.sleep(0.4)  # Small pacing delay for RPM rate limits
                 
                 pct = 20 + int((current_c / total_items) * 80)
                 progress_bar.progress(pct)
@@ -452,83 +459,91 @@ with tab_redline:
                 
                 log_msg = f"[{time.strftime('%H:%M:%S')}] ✅ Processed Clauses {i+1} to {current_c} of {total_items} ({pct}%)"
                 logs.append(log_msg)
-                print(log_msg, flush=True)
                 log_area.text("\n".join(logs[-12:]))
             
             elapsed = round(time.time() - start_time, 2)
-            completion_msg = f"⚡ Completed redlining in {elapsed} seconds! Generating Word file..."
-            print(f"================ {completion_msg} ================\n", flush=True)
-            st.success(completion_msg)
+            st.success(f"⚡ Completed redlining in {elapsed} seconds!")
             
             output_docx = create_redlined_docx(redline_results)
             with open(output_docx, "rb") as file_data:
                 st.download_button(
-                    label="📥 Download Redlined Document (.docx Track Changes)",
+                    label="📥 Download Redlined Document (.docx)",
                     data=file_data,
                     file_name="Redlined_Facility_Agreement.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 )
 
 # ---------------------------------------------------------------------
-# TAB 2: REPOSITORY INDEXING
+# TAB 2: CLOUD REPOSITORY INDEXING
 # ---------------------------------------------------------------------
 with tab_repository:
-    st.header("Upload Precedent Facility Agreements")
-    st.info(f"Documents uploaded here are saved permanently on disk inside:\n`{PERSIST_DIR}`")
+    st.header("Upload Precedent Facility Agreements to Cloud")
+    precedent_files = st.file_uploader("Upload Agreements (.docx)", type=["docx"], accept_multiple_files=True)
     
-    precedent_files = st.file_uploader("Upload Agreements / Playbooks (.docx)", type=["docx"], accept_multiple_files=True)
-    
-    if precedent_files and st.button("📥 Save Permanently to Disk Repository"):
-        collection = get_collection()
-        prog_bar = st.progress(0)
-        status_box = st.empty()
-        
-        debug_container = st.expander("🛠️ Real-Time Indexing Logs", expanded=True)
-        log_console = debug_container.empty()
-        logs = []
-        
-        total_files = len(precedent_files)
-        total_indexed_clauses = 0
-        
-        for file_idx, file in enumerate(precedent_files):
-            paragraphs = extract_paragraphs_from_docx(file)
-            total_paras = len(paragraphs)
+    if precedent_files and st.button("☁️ Save to Pinecone Cloud"):
+        if not pinecone_api_key or not pc_client:
+            st.error("Please provide a valid Pinecone API key.")
+        else:
+            prog_bar = st.progress(0)
+            status_box = st.empty()
+            debug_container = st.expander("🛠️ Real-Time Cloud Indexing Logs", expanded=True)
+            log_console = debug_container.empty()
+            logs = []
             
-            if total_paras == 0:
-                continue
+            total_files = len(precedent_files)
+            total_indexed = 0
+            
+            for file_idx, file in enumerate(precedent_files):
+                paragraphs = extract_paragraphs_from_docx(file)
+                total_paras = len(paragraphs)
+                if total_paras == 0:
+                    continue
                 
-            batch_size = 25
-            for i in range(0, total_paras, batch_size):
-                batch = paragraphs[i:i + batch_size]
-                ids = [f"{file.name}_p{i+j}_{int(time.time()*1000)}" for j in range(len(batch))]
-                metadatas = [{"source": file.name, "chunk": i+j} for j in range(len(batch))]
-                
-                collection.add(documents=batch, ids=ids, metadatas=metadatas)
-                total_indexed_clauses += len(batch)
-                
-                current_clause_num = min(i + batch_size, total_paras)
-                overall_pct = ((file_idx + (current_clause_num / total_paras)) / total_files)
-                prog_bar.progress(min(overall_pct, 1.0))
-                status_box.text(f"Indexing '{file.name}': Clause {current_clause_num}/{total_paras}...")
-                
-                log_line = f"[{time.strftime('%H:%M:%S')}] Saved to disk: Clauses {i+1} to {current_clause_num} from '{file.name}'"
-                logs.append(log_line)
-                print(log_line, flush=True)
-                log_console.text("\n".join(logs[-12:]))
-                
-        st.success(f"Successfully saved {total_indexed_clauses} clauses across {total_files} file(s) permanently to disk!")
-        time.sleep(1)
-        st.rerun()
+                batch_size = 20
+                for i in range(0, total_paras, batch_size):
+                    chunk = paragraphs[i : i + batch_size]
+                    
+                    # Embed via Pinecone Hosted Inference
+                    embeddings = pc_client.inference.embed(
+                        model=EMBED_MODEL,
+                        inputs=chunk,
+                        parameters={"input_type": "passage"}
+                    )
+                    
+                    vectors_to_upsert = []
+                    for j, (text, emb) in enumerate(zip(chunk, embeddings)):
+                        v_id = f"{file.name}_p{i+j}_{int(time.time())}"
+                        vectors_to_upsert.append({
+                            "id": v_id,
+                            "values": emb["values"],
+                            "metadata": {"text": text, "source": file.name, "chunk": i+j}
+                        })
+                    
+                    pc_index.upsert(vectors=vectors_to_upsert)
+                    total_indexed += len(chunk)
+                    
+                    current_clause = min(i + batch_size, total_paras)
+                    overall_pct = ((file_idx + (current_clause / total_paras)) / total_files)
+                    prog_bar.progress(min(overall_pct, 1.0))
+                    status_box.text(f"Uploading '{file.name}': {current_clause}/{total_paras} clauses...")
+                    
+                    log_line = f"[{time.strftime('%H:%M:%S')}] Upserted to Cloud: Clauses {i+1} to {current_clause} from '{file.name}'"
+                    logs.append(log_line)
+                    log_console.text("\n".join(logs[-12:]))
+            
+            st.success(f"Successfully uploaded {total_indexed} clauses to Pinecone Cloud Database!")
+            time.sleep(1)
+            st.rerun()
 
 # ---------------------------------------------------------------------
 # TAB 3: CHAT ASSISTANT
 # ---------------------------------------------------------------------
 with tab_chat:
-    st.header("Project Finance Chat Assistant")
+    st.header("Project Finance Cloud Chat Assistant")
     
     if "chat_messages" not in st.session_state:
         st.session_state.chat_messages = [
-            {"role": "assistant", "content": "Ask me any question regarding your repository or general project finance practices."}
+            {"role": "assistant", "content": "Ask me any question regarding your cloud repository precedents."}
         ]
     
     for msg in st.session_state.chat_messages:
@@ -536,38 +551,47 @@ with tab_chat:
             st.markdown(msg["content"])
             
     if user_query := st.chat_input("Ask a question..."):
-        collection = get_collection()
         active_key = primary_api_key or secondary_api_key
-        if not active_key:
-            st.error("Please enter a Groq API Key in the sidebar.")
+        if not active_key or not pc_client:
+            st.error("Please ensure Groq and Pinecone API Keys are provided.")
         else:
             st.session_state.chat_messages.append({"role": "user", "content": user_query})
             with st.chat_message("user"):
                 st.markdown(user_query)
                 
-            context_str = "NO DOCUMENTS IN REPOSITORY."
-            if collection.count() > 0:
-                relevant_docs = collection.query(query_texts=[user_query], n_results=5, include=["documents", "metadatas"])
-                if relevant_docs["documents"] and relevant_docs["documents"][0]:
-                    context_blocks = []
-                    for doc_text, meta in zip(relevant_docs["documents"][0], relevant_docs["metadatas"][0]):
-                        source = meta.get("source", "Unknown Document")
-                        context_blocks.append(f"From Precedent File [{source}]:\n\"{doc_text}\"")
-                    context_str = "\n\n".join(context_blocks)
+            # Query Pinecone
+            emb_res = pc_client.inference.embed(
+                model=EMBED_MODEL,
+                inputs=[user_query],
+                parameters={"input_type": "query"}
+            )
+            query_emb = emb_res[0]["values"]
+            
+            res = pc_index.query(vector=query_emb, top_k=5, include_metadata=True)
+            
+            context_blocks = []
+            if res.get("matches"):
+                for m in res["matches"]:
+                    if m["score"] > 0.6:
+                        src = m["metadata"].get("source", "Unknown Document")
+                        txt = m["metadata"].get("text", "")
+                        context_blocks.append(f"From Precedent File [{src}]:\n\"{txt}\"")
+            
+            context_str = "\n\n".join(context_blocks) if context_blocks else "NO DIRECT MATCHES FOUND IN CLOUD REPOSITORY."
 
             chat_system_prompt = f"""
             You are an expert Project Finance Legal Assistant.
             
-            1. REPOSITORY CHECK FIRST:
-               - Examine REPOSITORY CONTEXT.
+            1. CLOUD REPOSITORY CHECK FIRST:
+               - Examine CLOUD REPOSITORY CONTEXT.
                - IF FOUND: Answer directly and cite the source file (e.g., "According to [Filename.docx]...").
                  
             2. FALLBACK TO GENERAL MARKET PRACTICE:
                - IF NOT FOUND: Begin response with:
-                 "Your uploaded documents do not contain specific terms regarding this topic. However, in general project finance market practice, the following is typically followed:"
+                 "Your uploaded cloud documents do not contain specific terms regarding this topic. However, in general project finance market practice:"
                  Then explain general market practice.
 
-            RETRIEVED REPOSITORY CONTEXT:
+            RETRIEVED CLOUD CONTEXT:
             {context_str}
             """
             
