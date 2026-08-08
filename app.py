@@ -15,7 +15,7 @@ from pinecone import Pinecone, ServerlessSpec
 # 1. APPLICATION SETUP & PINECONE CLOUD VECTOR DB
 # =====================================================================
 st.set_page_config(
-    page_title="Cloud Project Finance AI Legal Redliner",
+    page_title="T-Bajaj AI Redliner Tool",
     page_icon="⚡",
     layout="wide",
 )
