@@ -324,7 +324,7 @@ def analyze_clause_batch(batch_items, custom_instruction, primary_key, secondary
 # 4. STREAMLIT UI & TABBED INTERFACE
 # =====================================================================
 
-st.title("☁️ Proj Finance AI Tool - T-Bajaj")
+st.title("☁️ Project Finance AI Tool - T-Bajaj")
 st.caption(" Redliner - Vector Database & Groq")
 
 # Read Secrets if available (Streamlit Cloud Secrets)
