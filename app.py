@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 import difflib
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,23 +25,27 @@ EMBED_MODEL = "multilingual-e5-large"  # Pinecone hosted embedding model (1024 d
 
 @st.cache_resource
 def init_pinecone(api_key):
-    """Initializes Pinecone client and ensures serverless index exists."""
+    """Initializes Pinecone client and ensures serverless index exists with 1024 dimensions."""
     if not api_key:
         return None, None
-    pc = Pinecone(api_key=api_key)
-    
-    # Create index if it doesn't exist
-    existing_indexes = [idx.name for idx in pc.list_indexes()]
-    if INDEX_NAME not in existing_indexes:
-        pc.create_index(
-            name=INDEX_NAME,
-            dimension=1024,
-            metric="cosine",
-            spec=ServerlessSpec(cloud="aws", region="us-east-1")
-        )
-    
-    index = pc.Index(INDEX_NAME)
-    return pc, index
+    try:
+        pc = Pinecone(api_key=api_key)
+        
+        # Create index if it doesn't exist
+        existing_indexes = [idx.name for idx in pc.list_indexes()]
+        if INDEX_NAME not in existing_indexes:
+            pc.create_index(
+                name=INDEX_NAME,
+                dimension=1024,  # Exact dimension match for multilingual-e5-large
+                metric="cosine",
+                spec=ServerlessSpec(cloud="aws", region="us-east-1")
+            )
+        
+        index = pc.Index(INDEX_NAME)
+        return pc, index
+    except Exception as e:
+        st.error(f"Failed to initialize Pinecone: {str(e)}")
+        return None, None
 
 # =====================================================================
 # 2. WORD DOCUMENT PARSING & WORD-BY-WORD TRACK CHANGES GENERATOR
@@ -129,7 +134,6 @@ def create_redlined_docx(paragraph_pairs, author="AI Legal Agent"):
 def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
     """Generates embeddings using Pinecone Hosted Inference and queries cloud vectors."""
     try:
-        # Generate embeddings using Pinecone Inference API
         embeddings = pc.inference.embed(
             model=EMBED_MODEL,
             inputs=chunk_paras,
@@ -160,7 +164,6 @@ def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
         return batch_results, len(chunk_paras)
     except Exception as e:
         print(f"❌ Pinecone Query Error: {e}", flush=True)
-        # Fallback empty context
         return [{
             "id": chunk_start_idx + idx,
             "clause": p_text,
@@ -168,7 +171,7 @@ def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
         } for idx, p_text in enumerate(chunk_paras)], len(chunk_paras)
 
 
-def run_parallel_pinecone_retrieval(pc, index, paragraphs, batch_size=15, max_workers=4, status_placeholder=None, progress_bar=None, log_area=None, logs_list=None):
+def run_parallel_pinecone_retrieval(pc, index, paragraphs, batch_size=10, max_workers=4, status_placeholder=None, progress_bar=None, log_area=None, logs_list=None):
     """Executes parallel retrieval against Pinecone Cloud DB."""
     total = len(paragraphs)
     prepared_items = [None] * total
@@ -298,7 +301,7 @@ def analyze_clause_batch(batch_items, custom_instruction, primary_key, secondary
                             print(f"⚠️ [Key 1 Rate Limit on {model_name}]: Switching to Secondary Key...", flush=True)
                             break
                         else:
-                            wait_time = (attempt + 1) * 4
+                            wait_time = (attempt + 1) * 3
                             print(f"⚠️ [Rate Limit Hit on {model_name}]: Retrying in {wait_time}s...", flush=True)
                             time.sleep(wait_time)
                             continue
@@ -358,9 +361,12 @@ with st.sidebar:
             st.caption("Unable to fetch stats.")
             
         if st.button("🗑️ Clear Cloud Memory"):
-            pc_index.delete(delete_all=True)
-            st.success("Cloud database erased!")
-            st.rerun()
+            try:
+                pc_index.delete(delete_all=True)
+                st.success("Cloud database erased!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error clearing cloud database: {e}")
 
 tab_redline, tab_repository, tab_chat = st.tabs([
     "🚀 High-Speed Redliner", 
@@ -406,7 +412,7 @@ with tab_redline:
                 pc=pc_client,
                 index=pc_index, 
                 paragraphs=paragraphs, 
-                batch_size=15, 
+                batch_size=10, 
                 max_workers=4,
                 status_placeholder=status_placeholder,
                 progress_bar=progress_bar,
@@ -420,7 +426,7 @@ with tab_redline:
             log_area.text("\n".join(logs[-12:]))
 
             # STEP 2: Batched LLM Analysis
-            BATCH_SIZE = 10
+            BATCH_SIZE = 12
             redline_results = []
             total_items = len(prepared_items)
             
@@ -451,7 +457,7 @@ with tab_redline:
                         res.get("is_acceptable", True)
                     ))
                 
-                time.sleep(0.4)  # Small pacing delay for RPM rate limits
+                time.sleep(0.3)  # Small pacing delay for RPM rate limits
                 
                 pct = 20 + int((current_c / total_items) * 80)
                 progress_bar.progress(pct)
@@ -499,39 +505,58 @@ with tab_repository:
                 if total_paras == 0:
                     continue
                 
-                batch_size = 20
+                batch_size = 10  # Kept small to stay safely below Pinecone 2MB limit
+                clean_fname = re.sub(r'[^a-zA-Z0-9_]', '_', file.name)
+                
                 for i in range(0, total_paras, batch_size):
                     chunk = paragraphs[i : i + batch_size]
                     
-                    # Embed via Pinecone Hosted Inference
-                    embeddings = pc_client.inference.embed(
-                        model=EMBED_MODEL,
-                        inputs=chunk,
-                        parameters={"input_type": "passage"}
-                    )
-                    
-                    vectors_to_upsert = []
-                    for j, (text, emb) in enumerate(zip(chunk, embeddings)):
-                        v_id = f"{file.name}_p{i+j}_{int(time.time())}"
-                        vectors_to_upsert.append({
-                            "id": v_id,
-                            "values": emb["values"],
-                            "metadata": {"text": text, "source": file.name, "chunk": i+j}
-                        })
-                    
-                    pc_index.upsert(vectors=vectors_to_upsert)
-                    total_indexed += len(chunk)
-                    
-                    current_clause = min(i + batch_size, total_paras)
-                    overall_pct = ((file_idx + (current_clause / total_paras)) / total_files)
-                    prog_bar.progress(min(overall_pct, 1.0))
-                    status_box.text(f"Uploading '{file.name}': {current_clause}/{total_paras} clauses...")
-                    
-                    log_line = f"[{time.strftime('%H:%M:%S')}] Upserted to Cloud: Clauses {i+1} to {current_clause} from '{file.name}'"
-                    logs.append(log_line)
-                    log_console.text("\n".join(logs[-12:]))
+                    try:
+                        # 1. Embed via Pinecone Hosted Inference
+                        embeddings = pc_client.inference.embed(
+                            model=EMBED_MODEL,
+                            inputs=chunk,
+                            parameters={"input_type": "passage"}
+                        )
+                        
+                        # 2. Structure Vectors safely
+                        vectors_to_upsert = []
+                        for j, (text, emb) in enumerate(zip(chunk, embeddings)):
+                            v_id = f"{clean_fname}_p{i+j}_{int(time.time()*1000)}"
+                            
+                            # Trim text if clause is unusually large
+                            metadata_text = text[:1500] if len(text) > 1500 else text
+                            
+                            vectors_to_upsert.append({
+                                "id": v_id,
+                                "values": emb["values"],
+                                "metadata": {
+                                    "text": metadata_text, 
+                                    "source": file.name, 
+                                    "chunk": i+j
+                                }
+                            })
+                        
+                        # 3. Upsert to Pinecone Cloud
+                        pc_index.upsert(vectors=vectors_to_upsert)
+                        total_indexed += len(chunk)
+                        
+                        current_clause = min(i + batch_size, total_paras)
+                        overall_pct = ((file_idx + (current_clause / total_paras)) / total_files)
+                        prog_bar.progress(min(overall_pct, 1.0))
+                        status_box.text(f"Uploading '{file.name}': {current_clause}/{total_paras} clauses...")
+                        
+                        log_line = f"[{time.strftime('%H:%M:%S')}] Upserted to Cloud: Clauses {i+1} to {current_clause} from '{file.name}'"
+                        logs.append(log_line)
+                        log_console.text("\n".join(logs[-12:]))
+                        
+                    except Exception as err:
+                        err_line = f"[{time.strftime('%H:%M:%S')}] ❌ Error upserting batch {i+1}-{i+len(chunk)}: {str(err)}"
+                        logs.append(err_line)
+                        log_console.text("\n".join(logs[-12:]))
+                        time.sleep(1)
             
-            st.success(f"Successfully uploaded {total_indexed} clauses to Pinecone Cloud Database!")
+            st.success(f"Successfully processed {total_indexed} clauses to Pinecone Cloud Database!")
             time.sleep(1)
             st.rerun()
 
@@ -559,25 +584,29 @@ with tab_chat:
             with st.chat_message("user"):
                 st.markdown(user_query)
                 
-            # Query Pinecone
-            emb_res = pc_client.inference.embed(
-                model=EMBED_MODEL,
-                inputs=[user_query],
-                parameters={"input_type": "query"}
-            )
-            query_emb = emb_res[0]["values"]
-            
-            res = pc_index.query(vector=query_emb, top_k=5, include_metadata=True)
-            
-            context_blocks = []
-            if res.get("matches"):
-                for m in res["matches"]:
-                    if m["score"] > 0.6:
-                        src = m["metadata"].get("source", "Unknown Document")
-                        txt = m["metadata"].get("text", "")
-                        context_blocks.append(f"From Precedent File [{src}]:\n\"{txt}\"")
-            
-            context_str = "\n\n".join(context_blocks) if context_blocks else "NO DIRECT MATCHES FOUND IN CLOUD REPOSITORY."
+            context_str = "NO DIRECT MATCHES FOUND IN CLOUD REPOSITORY."
+            try:
+                emb_res = pc_client.inference.embed(
+                    model=EMBED_MODEL,
+                    inputs=[user_query],
+                    parameters={"input_type": "query"}
+                )
+                query_emb = emb_res[0]["values"]
+                
+                res = pc_index.query(vector=query_emb, top_k=5, include_metadata=True)
+                
+                context_blocks = []
+                if res.get("matches"):
+                    for m in res["matches"]:
+                        if m["score"] > 0.6:
+                            src = m["metadata"].get("source", "Unknown Document")
+                            txt = m["metadata"].get("text", "")
+                            context_blocks.append(f"From Precedent File [{src}]:\n\"{txt}\"")
+                
+                if context_blocks:
+                    context_str = "\n\n".join(context_blocks)
+            except Exception as e:
+                print(f"Chat Context Search Error: {e}", flush=True)
 
             chat_system_prompt = f"""
             You are an expert Project Finance Legal Assistant.
