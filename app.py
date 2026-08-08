@@ -324,8 +324,8 @@ def analyze_clause_batch(batch_items, custom_instruction, primary_key, secondary
 # 4. STREAMLIT UI & TABBED INTERFACE
 # =====================================================================
 
-st.title("☁️ Project Finance AI Legal Agent (Pinecone Cloud)")
-st.caption("Surgical Redliner backed by Pinecone Serverless Vector Database & Groq")
+st.title("☁️ Test Project Finance Agent - Tarun)")
+st.caption(" Redliner - Vector Database & Groq")
 
 # Read Secrets if available (Streamlit Cloud Secrets)
 default_groq = st.secrets.get("GROQ_API_KEY", "") if "GROQ_API_KEY" in st.secrets else ""
@@ -483,7 +483,7 @@ with tab_redline:
 # TAB 2: CLOUD REPOSITORY INDEXING
 # ---------------------------------------------------------------------
 with tab_repository:
-    st.header("Upload Precedent Facility Agreements to Cloud")
+    st.header("Upload Precedent Facility Agreements to DB")
     precedent_files = st.file_uploader("Upload Agreements (.docx)", type=["docx"], accept_multiple_files=True)
     
     if precedent_files and st.button("☁️ Save to Pinecone Cloud"):
@@ -564,7 +564,7 @@ with tab_repository:
 # TAB 3: CHAT ASSISTANT
 # ---------------------------------------------------------------------
 with tab_chat:
-    st.header("Project Finance Cloud Chat Assistant")
+    st.header("Project Finance - TBajaj Assist")
     
     if "chat_messages" not in st.session_state:
         st.session_state.chat_messages = [
