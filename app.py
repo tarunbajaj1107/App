@@ -12,7 +12,7 @@ from pinecone import Pinecone, ServerlessSpec
 # 1. APPLICATION SETUP & PINECONE CLOUD VECTOR DB
 # =====================================================================
 st.set_page_config(
-    page_title="Tarun NVIDIA Nemotron AI Legal Reviewer (Word Comments)",
+    page_title="NVIDIA Nemotron AI Legal Reviewer (Word Comments)",
     page_icon="🟢",
     layout="wide",
 )
@@ -20,6 +20,8 @@ st.set_page_config(
 INDEX_NAME = "project-finance-playbook"
 EMBED_MODEL = "multilingual-e5-large"  # Pinecone hosted embedding model (1024 dims)
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+
+# Active Model Endpoint on NVIDIA Build API Catalog
 NVIDIA_MODEL = "nvidia/llama-3.1-nemotron-70b-instruct"
 
 @st.cache_resource
@@ -60,11 +62,16 @@ def extract_paragraphs_from_docx(docx_file):
     return paragraphs
 
 
+def docx_shared_indent(inches):
+    from docx.shared import Inches
+    return Inches(inches)
+
+
 def create_commented_docx(paragraph_results, author="NVIDIA Nemotron Legal AI"):
     """
     Generates a clean DOCX where suggestions and explanations are placed
     in native Word comments attached to paragraphs.
-    Includes a fail-safe inline callout if the environment blocks comment relations.
+    Includes a fail-safe inline callout if standard comment relations fail.
     """
     doc = Document()
 
@@ -85,27 +92,21 @@ def create_commented_docx(paragraph_results, author="NVIDIA Nemotron Legal AI"):
                     p.add_comment(text=full_comment_body, author=author, initials="AI")
                     comment_added = True
             except Exception as e:
-                print(f"Native comment insertion notice: {e}", flush=True)
+                print(f"[DEBUG] Native comment insertion notice: {e}", flush=True)
 
             # Method B: Fail-safe formatted callout box inside document
             if not comment_added:
                 p_sub = doc.add_paragraph()
                 p_sub.paragraph_format.left_indent = docx_shared_indent(0.25)
-                run_tag = p_sub.add_run(f"💬 [NVIDIA AI Legal Review Note]:\n")
+                run_tag = p_sub.add_run("💬 [NVIDIA AI Legal Review Note]:\n")
                 run_tag.bold = True
                 
                 run_body = p_sub.add_run(full_comment_body)
                 run_body.font.italic = True
-                run_body.font.size = 100000  # standard ~10pt
 
     output_path = "Reviewed_Facility_Agreement_Comments.docx"
     doc.save(output_path)
     return output_path
-
-
-def docx_shared_indent(inches):
-    from docx.shared import Inches
-    return Inches(inches)
 
 # =====================================================================
 # 3. CLOUD VECTOR RETRIEVAL & NEMOTRON LLM ENGINE
@@ -143,7 +144,7 @@ def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
             })
         return batch_results, len(chunk_paras)
     except Exception as e:
-        print(f"❌ Pinecone Query Error: {e}", flush=True)
+        print(f"❌ [DEBUG] Pinecone Query Error: {e}", flush=True)
         return [{
             "id": chunk_start_idx + idx,
             "clause": p_text,
@@ -193,9 +194,13 @@ def run_parallel_pinecone_retrieval(pc, index, paragraphs, batch_size=10, max_wo
 
 
 def analyze_clause_batch_nemotron(batch_items, custom_instruction, nvidia_api_key):
-    """Analyzes clause batches using NVIDIA Nemotron via OpenAI SDK."""
+    """Analyzes clause batches using NVIDIA Nemotron via OpenAI SDK with explicit Debug Logging."""
     if not nvidia_api_key:
+        st.error("❌ NVIDIA API Key is missing!")
         return []
+
+    print(f"\n[DEBUG] Connecting to URL: {NVIDIA_BASE_URL}", flush=True)
+    print(f"[DEBUG] Attempting Model ID: {NVIDIA_MODEL}", flush=True)
 
     client = OpenAI(
         base_url=NVIDIA_BASE_URL,
@@ -233,13 +238,10 @@ def analyze_clause_batch_nemotron(batch_items, custom_instruction, nvidia_api_ke
     }
     """
     
-    formatted_input = []
-    for item in batch_items:
-        formatted_input.append({
-            "id": item["id"],
-            "clause": item["clause"],
-            "repository_context": item["context"]
-        })
+    formatted_input = [
+        {"id": item["id"], "clause": item["clause"], "repository_context": item["context"]}
+        for item in batch_items
+    ]
 
     user_prompt = f"""
     DEAL-SPECIFIC OVERRIDE DIRECTIVE:
@@ -251,31 +253,43 @@ def analyze_clause_batch_nemotron(batch_items, custom_instruction, nvidia_api_ke
 
     for attempt in range(3):
         try:
+            print(f"[DEBUG] Sending Request (Attempt {attempt+1})...", flush=True)
+            
             response = client.chat.completions.create(
                 model=NVIDIA_MODEL,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                response_format={"type": "json_object"},
                 temperature=0.1
             )
-            data = json.loads(response.choices[0].message.content)
+            
+            raw_content = response.choices[0].message.content
+            print(f"[DEBUG] Raw Response Success! Length: {len(raw_content)} chars", flush=True)
+            
+            # Remove potential markdown wrappers around JSON
+            if raw_content.startswith("```"):
+                raw_content = re.sub(r"^```[a-zA-Z]*\n", "", raw_content)
+                raw_content = re.sub(r"\n```$", "", raw_content)
+
+            data = json.loads(raw_content)
             return data.get("results", [])
             
         except Exception as e:
-            print(f"⚠️ [Nemotron API Error Attempt {attempt+1}]: {str(e)}", flush=True)
+            err_msg = f"❌ [Attempt {attempt+1} Failed] Model: '{NVIDIA_MODEL}' | Error: {str(e)}"
+            print(f"[DEBUG] {err_msg}", flush=True)
+            st.warning(f"⚠️ NVIDIA API Call Issue:\n- Model: `{NVIDIA_MODEL}`\n- Error: `{str(e)}`")
             time.sleep((attempt + 1) * 2)
 
-    fallback_results = []
-    for item in batch_items:
-        fallback_results.append({
+    return [
+        {
             "id": item["id"],
             "is_acceptable": False,
             "proposed_text": item["clause"],
-            "explanation": "Flagged for manual review due to API timeout."
-        })
-    return fallback_results
+            "explanation": "Flagged for manual review due to API endpoint issue."
+        }
+        for item in batch_items
+    ]
 
 # =====================================================================
 # 4. STREAMLIT UI & TABBED INTERFACE
@@ -546,7 +560,7 @@ with tab_chat:
                 if context_blocks:
                     context_str = "\n\n".join(context_blocks)
             except Exception as e:
-                print(f"Chat Context Search Error: {e}", flush=True)
+                print(f"[DEBUG] Chat Context Search Error: {e}", flush=True)
 
             chat_system_prompt = f"""
             You are NVIDIA Nemotron, an expert Legal Assistant.
