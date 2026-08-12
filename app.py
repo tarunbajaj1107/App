@@ -11,10 +11,10 @@ import streamlit as st
 from pinecone import Pinecone, ServerlessSpec
 
 # =====================================================================
-# 1. APPLICATION SETUP & PINECONE DB
+# 1. APPLICATION SETUP & PINECONE DB CONFIG
 # =====================================================================
 st.set_page_config(
-    page_title="NVIDIA AI Legal Reviewer (Material Review Only)",
+    page_title="NVIDIA AI Legal Reviewer (Legal & Commercial Alignment)",
     page_icon="💬",
     layout="wide",
 )
@@ -26,7 +26,7 @@ NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 # Active Model Endpoint
 NVIDIA_MODEL = "meta/llama-3.1-8b-instruct"
 
-# Reduced batch size prevents HTTP socket drops/timeouts
+# Small batch size keeps request payloads small and avoids connection drops
 BATCH_SIZE = 4 
 
 @st.cache_resource
@@ -115,7 +115,7 @@ def create_commented_docx(paragraph_results, author="AI Legal Reviewer"):
 
     for orig_text, suggested_text, explanation, is_acceptable in paragraph_results:
         p = doc.add_paragraph()
-        run = p.add_run(orig_text)
+        p.add_run(orig_text)
 
         if not is_acceptable and orig_text.strip() != suggested_text.strip():
             comment_added = False
@@ -145,6 +145,7 @@ def create_commented_docx(paragraph_results, author="AI Legal Reviewer"):
 # =====================================================================
 
 def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
+    """Retrieves top 3 contextual precedents per clause to give the LLM deeper legal context."""
     try:
         embeddings = pc.inference.embed(
             model=EMBED_MODEL,
@@ -156,17 +157,19 @@ def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
         for idx, (p_text, emb) in enumerate(zip(chunk_paras, embeddings)):
             res = index.query(
                 vector=emb["values"],
-                top_k=1,
+                top_k=3,  # Top 3 context window captures surrounding definitions and mechanics
                 include_metadata=True
             )
             
-            ctx = "NO DIRECT REPOSITORY PRECEDENT FOUND."
+            ctx_list = []
             if res.get("matches") and len(res["matches"]) > 0:
-                match = res["matches"][0]
-                if match["score"] > 0.65:
-                    doc_str = match["metadata"].get("text", "")
-                    src = match["metadata"].get("source", "Repo")
-                    ctx = f"Precedent from [{src}]: \"{doc_str}\""
+                for match in res["matches"]:
+                    if match["score"] > 0.58:  # Broadened threshold to grab structural legal context
+                        doc_str = match["metadata"].get("text", "")
+                        src = match["metadata"].get("source", "Repo")
+                        ctx_list.append(f"Precedent [{src}]: \"{doc_str}\"")
+            
+            ctx = "\n".join(ctx_list) if ctx_list else "NO DIRECT REPOSITORY PRECEDENT FOUND."
             
             batch_results.append({
                 "id": chunk_start_idx + idx,
@@ -224,7 +227,7 @@ def run_parallel_pinecone_retrieval(pc, index, paragraphs, batch_size=5, max_wor
 
 
 def extract_json_from_text(raw_text):
-    """Extracts JSON payload even if LLM appends surrounding conversational text."""
+    """Extracts JSON payload even if LLM appends surrounding text."""
     raw_text = raw_text.strip()
     
     if raw_text.startswith("```"):
@@ -244,12 +247,11 @@ def extract_json_from_text(raw_text):
 
 
 def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
-    """Analyzes clause batches using active LLM with explicit connection timeouts."""
+    """Analyzes clause batches against legal, commercial, and financial precedent standards."""
     if not nvidia_api_key:
         st.error("❌ API Key is missing!")
         return []
 
-    # Configured with explicit timeouts to prevent connection drops
     client = OpenAI(
         base_url=NVIDIA_BASE_URL,
         api_key=nvidia_api_key,
@@ -258,18 +260,29 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
     )
 
     system_prompt = """
-    You are a Senior Legal Counsel evaluating contract clauses against standard precedent loan agreements.
+    You are a Senior Legal Counsel evaluating draft contract clauses against standard precedent loan agreements.
 
-    CRITICAL RULE - MATERIALITY FILTER:
-    1. DO NOT comment on purely cosmetic, stylistic, grammatical, or drafting differences that DO NOT change the legal or commercial interpretation.
-    2. Mark 'is_acceptable': true IF the clause carries substantially the same legal effect, rights, liabilities, or obligations as precedent, even if phrased differently.
-    3. ONLY mark 'is_acceptable': false IF there is a MATERIAL DISCREPANCY.
-    4. If 'is_acceptable' is true: set 'proposed_text' to the original clause and 'explanation' to "".
+    CRITICAL INSTRUCTIONS FOR MATERIALITY REVIEW:
 
-    OUTPUT RULES:
-    - Respond ONLY with a valid JSON object.
-    - DO NOT include conversational preamble or trailing explanation text.
-    
+    1. COMMERCIAL & FINANCIAL POSITIONS (FLAG MANDATORILY):
+       - Financial covenants, debt-to-equity ratios, DSCR, leverage caps, interest margins, fee structures.
+       - Mandatory prepayment events, yield protection, tax gross-up provisions, payment waterfalls, and baseline thresholds.
+       - ANY numerical or structural deviation from precedent commercial terms MUST be marked 'is_acceptable': false.
+
+    2. LEGAL RISK & LIABILITY ALLOCATIONS (FLAG MANDATORILY):
+       - Events of Default (EoD) triggers, cross-default/cross-acceleration thresholds, cure periods (remedy windows).
+       - Material Adverse Effect (MAE/MAC) scope, indemnity horizons, representations & warranties (R&Ws) qualification standards.
+       - Transferability, assignment rights, borrower restrictions, information undertakings, and governing law/dispute terms.
+       - IF draft terms are more onerous, restrictive, ambiguous, or legally disadvantageous compared to precedent, mark 'is_acceptable': false.
+
+    3. COSMETIC & STYLISTIC FILTER (IGNORE):
+       - DO NOT comment on purely cosmetic, grammatical, or word-order changes if the legal, commercial, and risk outcome is functionally identical.
+
+    4. OUTPUT REQUIREMENTS:
+       - If 'is_acceptable' is true: set 'proposed_text' to original clause and 'explanation' to "".
+       - If 'is_acceptable' is false: set 'proposed_text' to the recommended alignment with precedent, and explain the commercial/legal impact in 'explanation'.
+       - Respond ONLY with valid JSON. No conversational preamble or trailing explanation text.
+
     JSON STRUCTURE:
     {
       "results": [
@@ -288,7 +301,7 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
         for item in batch_items
     ]
 
-    user_prompt = f"DEAL DIRECTIVE: {custom_instruction}\nCLAUSES: {json.dumps(formatted_input)}"
+    user_prompt = f"DEAL DIRECTIVES / OVERRIDES: {custom_instruction}\nCLAUSES TO REVIEW: {json.dumps(formatted_input)}"
 
     for attempt in range(3):
         try:
@@ -325,7 +338,7 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
 # 4. STREAMLIT UI & TABBED INTERFACE
 # =====================================================================
 
-st.title("💬 Legal Contract AI Auditor (Material Reviews Only)")
+st.title("💬 Legal Contract AI Auditor (Legal & Commercial Alignment)")
 st.caption("Substantive Legal Review with Redlined Balloon Comments backed by Pinecone & NVIDIA Llama 3.1 8B")
 
 default_nvidia = st.secrets.get("NVIDIA_API_KEY", "") if "NVIDIA_API_KEY" in st.secrets else ""
@@ -373,7 +386,11 @@ with tab_review:
     st.header("Compare Draft against Precedent Agreements")
     
     uploaded_draft = st.file_uploader("Upload Target Facility Agreement (.docx)", type=["docx"], key="target_doc")
-    custom_instruction = st.text_area("Optional Deal Directives / Overrides", placeholder="e.g., 'Ensure minimum DSCR covenant is set to 1.25x'.")
+    custom_instruction = st.text_area(
+        "Optional Deal Directives / Overrides", 
+        value="Flag all deviations from precedent regarding financial covenants (Debt-to-Equity, DSCR), commercial terms, cure periods, and liability exposure.",
+        placeholder="e.g., 'Ensure minimum DSCR covenant is set to 1.25x'."
+    )
     
     if st.button("💬 Analyze Contract (Generate Substantive Comments)", type="primary"):
         if not nvidia_api_key:
@@ -417,7 +434,7 @@ with tab_review:
             logs.append(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Precedents retrieved in {vec_elapsed}s! Evaluating with Llama 3.1 8B...")
             log_area.text("\n".join(logs[-12:]))
 
-            # STEP 2: LLM Evaluation (Controlled Batches)
+            # STEP 2: LLM Evaluation
             comment_results = []
             total_items = len(prepared_items)
             
