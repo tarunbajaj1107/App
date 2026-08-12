@@ -338,7 +338,7 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
 # 4. STREAMLIT UI & TABBED INTERFACE
 # =====================================================================
 
-st.title("💬 Legal Contract AI Auditor (Legal & Commercial Alignment)")
+st.title("💬 Contract AI Auditor T-Bajaj (Legal & Commercial Alignment)")
 st.caption("Substantive Legal Review with Redlined Balloon Comments backed by Pinecone & NVIDIA Llama 3.1 8B")
 
 default_nvidia = st.secrets.get("NVIDIA_API_KEY", "") if "NVIDIA_API_KEY" in st.secrets else ""
@@ -383,7 +383,7 @@ tab_review, tab_repository, tab_chat = st.tabs([
 # TAB 1: WORD COMMENT REVIEWER
 # ---------------------------------------------------------------------
 with tab_review:
-    st.header("Compare Draft against Precedent Agreements")
+    st.header("Compare Draft against Precedent Agreements - TBajaj")
     
     uploaded_draft = st.file_uploader("Upload Target Facility Agreement (.docx)", type=["docx"], key="target_doc")
     custom_instruction = st.text_area(
