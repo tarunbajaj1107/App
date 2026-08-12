@@ -227,7 +227,7 @@ def run_parallel_pinecone_retrieval(pc, index, paragraphs, batch_size=5, max_wor
 
 
 def extract_json_from_text(raw_text):
-    """Extracts JSON payload even if LLM appends surrounding text."""
+    """Extracts JSON payload safely whether the LLM outputs an Object or a List."""
     raw_text = raw_text.strip()
     
     if raw_text.startswith("```"):
@@ -235,7 +235,7 @@ def extract_json_from_text(raw_text):
         raw_text = re.sub(r"\n?```$", "", raw_text)
         raw_text = raw_text.strip()
 
-    match = re.search(r"\{[\s\S]*\}", raw_text)
+    match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", raw_text)
     if match:
         json_candidate = match.group(0)
         try:
@@ -259,7 +259,6 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
         max_retries=3
     )
 
-    # BORROWER-FRIENDLY REVIEW PROMPT
     system_prompt = """
     You are Senior Legal Counsel representing the BORROWER in loan agreement negotiations.
 
@@ -283,7 +282,17 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
     OUTPUT DIRECTIVES:
     - For every rejected clause, propose a complete, borrower-protective redlined text in 'proposed_text'.
     - In 'explanation', detail the borrower risk using: "[Source A Precedent Protection]" or "[Source B Borrower Protection]" followed by the rationale.
-    - Respond STRICTLY in valid JSON.
+    - Respond STRICTLY in valid JSON using this structure:
+    {
+      "results": [
+        {
+          "id": 1,
+          "is_acceptable": false,
+          "proposed_text": "string",
+          "explanation": "string"
+        }
+      ]
+    }
     """
     
     formatted_input = [
@@ -311,8 +320,13 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
             
             raw_content = response.choices[0].message.content
             data = extract_json_from_text(raw_content)
-            return data.get("results", [])
             
+            # Safe handling for both Array and Dict returns
+            if isinstance(data, list):
+                return data
+            elif isinstance(data, dict):
+                return data.get("results", [])
+                
         except Exception as e:
             err_msg = f"❌ [Attempt {attempt+1} Failed] Model: '{NVIDIA_MODEL}' | Error: {str(e)}"
             print(f"[DEBUG] {err_msg}", flush=True)
@@ -442,7 +456,7 @@ with tab_review:
                     nvidia_api_key=nvidia_api_key
                 )
                 
-                eval_map = {res["id"]: res for res in batch_evals}
+                eval_map = {res["id"]: res for res in batch_evals if isinstance(res, dict) and "id" in res}
                 for item in batch:
                     res = eval_map.get(item["id"], {
                         "is_acceptable": True,
