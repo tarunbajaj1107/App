@@ -22,7 +22,7 @@ EMBED_MODEL = "multilingual-e5-large"  # Pinecone hosted embedding model (1024 d
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
 # Active Model Endpoint on NVIDIA Build API Catalog
-NVIDIA_MODEL = "nvidia/llama-3.1-nemotron-70b-instruct"
+NVIDIA_MODEL = "meta/llama-3.1-8b-instruct"
 
 @st.cache_resource
 def init_pinecone(api_key):
