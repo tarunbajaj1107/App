@@ -2,12 +2,12 @@ import json
 import os
 import re
 import time
-import difflib
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from docx import Document
-from docx.oxml import parse_xml
-from docx.oxml.ns import nsdecls
-from groq import Groq
+from docx.oxml import OxmlElement, parse_xml
+from docx.oxml.ns import nsdecls, qn
+from openai import OpenAI
 import streamlit as st
 from pinecone import Pinecone, ServerlessSpec
 
@@ -15,13 +15,15 @@ from pinecone import Pinecone, ServerlessSpec
 # 1. APPLICATION SETUP & PINECONE CLOUD VECTOR DB
 # =====================================================================
 st.set_page_config(
-    page_title="T-Bajaj AI Redliner Tool",
-    page_icon="⚡",
+    page_title="NVIDIA Nemotron AI Legal Reviewer (Word Comments)",
+    page_icon="🟢",
     layout="wide",
 )
 
 INDEX_NAME = "project-finance-playbook"
 EMBED_MODEL = "multilingual-e5-large"  # Pinecone hosted embedding model (1024 dims)
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+NVIDIA_MODEL = "nvidia/nemotron-4-340b-instruct"
 
 @st.cache_resource
 def init_pinecone(api_key):
@@ -48,7 +50,7 @@ def init_pinecone(api_key):
         return None, None
 
 # =====================================================================
-# 2. WORD DOCUMENT PARSING & WORD-BY-WORD TRACK CHANGES GENERATOR
+# 2. WORD DOCUMENT PARSING & NATIVE WORD COMMENTS GENERATOR
 # =====================================================================
 
 def extract_paragraphs_from_docx(docx_file):
@@ -60,75 +62,89 @@ def extract_paragraphs_from_docx(docx_file):
             paragraphs.append(text)
     return paragraphs
 
-def create_redlined_docx(paragraph_pairs, author="AI Legal Agent"):
+def add_native_comment(p, author, comment_text, comment_id):
     """
-    Generates DOCX with native track changes at the word level using difflib.
+    Appends native MS Word comment XML elements to a paragraph.
+    """
+    # 1. Create or access comments.xml part
+    part = p.part
+    try:
+        comments_part = part.package.parts[qn('w:comments')]
+    except KeyError:
+        # Create comments part if it doesn't exist
+        comments_xml = OxmlElement('w:comments')
+        comments_part = part.package.relate_to(
+            comments_xml,
+            'http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments'
+        )
+
+    # 2. Add comment element
+    comment_elem = OxmlElement('w:comment')
+    comment_elem.set(qn('w:id'), str(comment_id))
+    comment_elem.set(qn('w:author'), author)
+    comment_elem.set(qn('w:date'), time.strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+    p_elem = OxmlElement('w:p')
+    r_elem = OxmlElement('w:r')
+    t_elem = OxmlElement('w:t')
+    t_elem.text = comment_text
+    r_elem.append(t_elem)
+    p_elem.append(r_elem)
+    comment_elem.append(p_elem)
+
+    # Attach to root comments node
+    comments_part._element.append(comment_elem)
+
+    # 3. Wrap paragraph runs with Comment Range Start & End
+    comment_range_start = OxmlElement('w:commentRangeStart')
+    comment_range_start.set(qn('w:id'), str(comment_id))
+    
+    comment_range_end = OxmlElement('w:commentRangeEnd')
+    comment_range_end.set(qn('w:id'), str(comment_id))
+
+    comment_reference = OxmlElement('w:commentReference')
+    comment_reference.set(qn('w:id'), str(comment_id))
+
+    r_ref = OxmlElement('w:r')
+    r_ref.append(comment_reference)
+
+    p._p.insert(0, comment_range_start)
+    p._p.append(comment_range_end)
+    p._p.append(r_ref)
+
+
+def create_commented_docx(paragraph_results, author="NVIDIA Nemotron Legal AI"):
+    """
+    Generates a clean DOCX where suggestions and explanations are placed
+    in Word comments attached to paragraphs instead of inline track changes.
     """
     doc = Document()
-    
-    for orig_text, new_text, explanation, is_acceptable in paragraph_pairs:
-        p = doc.add_paragraph()
-        
-        if is_acceptable or orig_text == new_text:
-            p.add_run(orig_text)
-        else:
-            orig_words = orig_text.split()
-            new_words = new_text.split()
-            
-            matcher = difflib.SequenceMatcher(None, orig_words, new_words)
-            
-            for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-                if tag == 'equal':
-                    p.add_run(" " + " ".join(orig_words[i1:i2]))
-                elif tag == 'delete':
-                    del_text = " " + " ".join(orig_words[i1:i2])
-                    clean_del = del_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                    del_xml = (
-                        f'<w:del {nsdecls("w")} w:author="{author}">'
-                        f'<w:r><w:delText>{clean_del}</w:delText></w:r>'
-                        f'</w:del>'
-                    )
-                    p._p.append(parse_xml(del_xml))
-                elif tag == 'insert':
-                    ins_text = " " + " ".join(new_words[j1:j2])
-                    clean_ins = ins_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                    ins_xml = (
-                        f'<w:ins {nsdecls("w")} w:author="{author}">'
-                        f'<w:r><w:t>{clean_ins}</w:t></w:r>'
-                        f'</w:ins>'
-                    )
-                    p._p.append(parse_xml(ins_xml))
-                elif tag == 'replace':
-                    del_text = " " + " ".join(orig_words[i1:i2])
-                    clean_del = del_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                    del_xml = (
-                        f'<w:del {nsdecls("w")} w:author="{author}">'
-                        f'<w:r><w:delText>{clean_del}</w:delText></w:r>'
-                        f'</w:del>'
-                    )
-                    p._p.append(parse_xml(del_xml))
-                    
-                    ins_text = " " + " ".join(new_words[j1:j2])
-                    clean_ins = ins_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                    ins_xml = (
-                        f'<w:ins {nsdecls("w")} w:author="{author}">'
-                        f'<w:r><w:t>{clean_ins}</w:t></w:r>'
-                        f'</w:ins>'
-                    )
-                    p._p.append(parse_xml(ins_xml))
+    comment_counter = 0
 
-            # Add explanatory note as a formatted sub-paragraph
-            comment_p = doc.add_paragraph()
-            run = comment_p.add_run(f" 💡 [AI Legal Note: {explanation}]")
-            run.font.italic = True
-            run.font.size = 10
+    for orig_text, suggested_text, explanation, is_acceptable in paragraph_results:
+        p = doc.add_paragraph(orig_text)
 
-    output_path = "Redlined_Facility_Agreement.docx"
+        if not is_acceptable and orig_text != suggested_text:
+            comment_counter += 1
+            full_comment_body = (
+                f"💡 SUGGESTION / REVISION:\n\"{suggested_text}\"\n\n"
+                f"📌 REASON & PRECEDENT:\n{explanation}"
+            )
+            try:
+                add_native_comment(p, author, full_comment_body, comment_counter)
+            except Exception as e:
+                # Fallback to inline callout box if Word XML manipulation encounters a edge case
+                p_sub = doc.add_paragraph()
+                r = p_sub.add_run(f"💬 [Comment Suggestion]: {full_comment_body}")
+                r.font.italic = True
+                r.font.size = 10
+
+    output_path = "Reviewed_Facility_Agreement_Comments.docx"
     doc.save(output_path)
     return output_path
 
 # =====================================================================
-# 3. CLOUD VECTOR RETRIEVAL & LLM ENGINE
+# 3. CLOUD VECTOR RETRIEVAL & NEMOTRON LLM ENGINE
 # =====================================================================
 
 def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
@@ -212,33 +228,33 @@ def run_parallel_pinecone_retrieval(pc, index, paragraphs, batch_size=10, max_wo
     return prepared_items
 
 
-def analyze_clause_batch(batch_items, custom_instruction, primary_key, secondary_key, model_strategy):
-    """Analyzes clause batches using Groq LLM with dual-key failover and exponential backoff."""
-    api_keys = [k for k in [primary_key, secondary_key] if k and k.strip()]
-    if not api_keys:
+def analyze_clause_batch_nemotron(batch_items, custom_instruction, nvidia_api_key):
+    """Analyzes clause batches using NVIDIA Nemotron via OpenAI SDK."""
+    if not nvidia_api_key:
         return []
 
-    system_prompt = """
-    You are an expert Legal & Contract Analyst performing minimal, surgical contract redlining.
+    client = OpenAI(
+        base_url=NVIDIA_BASE_URL,
+        api_key=nvidia_api_key
+    )
 
-    CRITICAL INSTRUCTION FOR REDLINING:
-    - DO NOT REPHRASE OR REWRITE THE ENGLISH LANGUAGE OF THE CLAUSE.
-    - PRESERVE ORIGINAL WORDING, SENTENCE STRUCTURE, AND PUNCTUATION AS MUCH AS POSSIBLE.
-    - ONLY edit specific key terms (e.g., financial ratios, grace periods, party obligations, thresholds, covenants) to align the LEGAL POSITION with the provided PRECEDENT.
-    - If a clause is acceptable or differs only in style/phrasing, MARK IT AS ACCEPTABLE and leave 'proposed_text' identical to the original clause.
-    - If changes are needed, apply SURGICAL EDITS (changing only the specific words/numbers necessary) so that track changes in MS Word highlight only tiny, precise edits rather than deleting the entire sentence.
+    system_prompt = """
+    You are NVIDIA Nemotron, an expert Legal & Contract Analyst comparing contract clauses against precedent loan agreements.
+
+    INSTRUCTIONS FOR COMMENT-BASED REVIEW:
+    - Compare each input 'clause' against 'repository_context' (Precedent Agreement).
+    - If a clause is UNACCEPTABLE or strays from precedent, provide a revised wording recommendation along with a clear reason.
+    - If acceptable, mark 'is_acceptable': true.
 
     EVALUATION RULES FOR EACH ITEM:
-    1. Compare 'clause' against 'context' (Repository Precedent).
-    2. If ACCEPTABLE or substantially equivalent in legal effect:
+    1. If ACCEPTABLE or substantially equivalent in legal effect to repository context:
        - 'is_acceptable': true
-       - 'proposed_text': EXACT ORIGINAL CLAUSE TEXT (do not change a single word)
-       - 'explanation': "Matches repository precedent position."
-    3. If UNACCEPTABLE / NEEDS LEGAL ADJUSTMENT:
+       - 'proposed_text': EXACT ORIGINAL CLAUSE TEXT
+       - 'explanation': "Matches precedent agreement standard."
+    2. If UNACCEPTABLE / NEEDS LEGAL ADJUSTMENT:
        - 'is_acceptable': false
-       - 'proposed_text': Original clause with MINIMAL target edits (change only numbers, durations, covenants, or legal terms to match precedent position).
-       - 'explanation': Brief reason for the position change.
-    4. If NO PRECEDENT IN CONTEXT: Evaluate against standard market project finance practice using the same minimal edit rules.
+       - 'proposed_text': Clean, proposed replacement text for the clause.
+       - 'explanation': Detailed reason describing why the revision is suggested based on the precedent agreement.
 
     YOU MUST RETURN A STRICT JSON OBJECT WITH A SINGLE KEY "results" CONTAINING AN ARRAY matching the order of input items:
     {
@@ -265,50 +281,27 @@ def analyze_clause_batch(batch_items, custom_instruction, primary_key, secondary
     DEAL-SPECIFIC OVERRIDE DIRECTIVE:
     {custom_instruction if custom_instruction else "None provided. Rely on repository precedent contexts."}
 
-    REMINDER: PRESERVE ORIGINAL WORDING. Only change the specific words/values necessary to adjust the legal position.
-
     CLAUSES TO ANALYZE IN BATCH:
     {json.dumps(formatted_input, indent=2)}
     """
 
-    if "llama-3.1-8b-instant" in model_strategy:
-        models_to_try = ["llama-3.1-8b-instant"]
-    else:
-        models_to_try = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
-
-    for key_idx, current_key in enumerate(api_keys):
-        client = Groq(api_key=current_key)
-        
-        for model_name in models_to_try:
-            for attempt in range(3):
-                try:
-                    response = client.chat.completions.create(
-                        model=model_name,
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt}
-                        ],
-                        response_format={"type": "json_object"},
-                        temperature=0.0
-                    )
-                    data = json.loads(response.choices[0].message.content)
-                    return data.get("results", [])
-                    
-                except Exception as e:
-                    err_msg = str(e)
-                    if "429" in err_msg or "rate_limit_exceeded" in err_msg:
-                        if len(api_keys) > 1 and key_idx == 0:
-                            print(f"⚠️ [Key 1 Rate Limit on {model_name}]: Switching to Secondary Key...", flush=True)
-                            break
-                        else:
-                            wait_time = (attempt + 1) * 3
-                            print(f"⚠️ [Rate Limit Hit on {model_name}]: Retrying in {wait_time}s...", flush=True)
-                            time.sleep(wait_time)
-                            continue
-                    else:
-                        print(f"❌ [Groq API Error]: {err_msg}", flush=True)
-                        time.sleep(2)
-                        break
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model=NVIDIA_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1
+            )
+            data = json.loads(response.choices[0].message.content)
+            return data.get("results", [])
+            
+        except Exception as e:
+            print(f"⚠️ [Nemotron API Error Attempt {attempt+1}]: {str(e)}", flush=True)
+            time.sleep((attempt + 1) * 2)
 
     fallback_results = []
     for item in batch_items:
@@ -316,7 +309,7 @@ def analyze_clause_batch(batch_items, custom_instruction, primary_key, secondary
             "id": item["id"],
             "is_acceptable": True,
             "proposed_text": item["clause"],
-            "explanation": "Skipped due to API rate limits."
+            "explanation": "Skipped due to API connection timeouts."
         })
     return fallback_results
 
@@ -324,29 +317,20 @@ def analyze_clause_batch(batch_items, custom_instruction, primary_key, secondary
 # 4. STREAMLIT UI & TABBED INTERFACE
 # =====================================================================
 
-st.title("☁️ Project Finance AI Tool - T-Bajaj")
-st.caption(" Redliner - Vector Database & Groq")
+st.title("🟢 NVIDIA Nemotron AI Legal Reviewer")
+st.caption("Contract Auditor backed by NVIDIA Nemotron-4 LLM & Pinecone Serverless Vector DB")
 
-# Read Secrets if available (Streamlit Cloud Secrets)
-default_groq = st.secrets.get("GROQ_API_KEY", "") if "GROQ_API_KEY" in st.secrets else ""
+default_nvidia = st.secrets.get("NVIDIA_API_KEY", "") if "NVIDIA_API_KEY" in st.secrets else ""
 default_pinecone = st.secrets.get("PINECONE_API_KEY", "") if "PINECONE_API_KEY" in st.secrets else ""
 
 with st.sidebar:
     st.header("🔑 Credentials")
+    nvidia_api_key = st.text_input("NVIDIA API Key", value=default_nvidia, type="password")
     pinecone_api_key = st.text_input("Pinecone API Key", value=default_pinecone, type="password")
-    primary_api_key = st.text_input("Primary Groq API Key", value=default_groq, type="password")
-    secondary_api_key = st.text_input("Secondary Groq API Key (Optional)", type="password")
     
     st.divider()
-    st.header("⚙️ Model Strategy")
-    selected_model_mode = st.radio(
-        "Select Processing Strategy:",
-        options=[
-            "Fastest & Highest Limit (llama-3.1-8b-instant)", 
-            "High Accuracy (llama-3.3-70b-versatile with 8b Fallback)"
-        ],
-        index=0
-    )
+    st.header("⚙️ Model Settings")
+    st.info(f"**LLM:** `{NVIDIA_MODEL}`\n\n**Output Mode:** Word Comments (No Redlines)")
     
     st.divider()
     st.header("☁️ Cloud Vector Storage")
@@ -368,24 +352,24 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Error clearing cloud database: {e}")
 
-tab_redline, tab_repository, tab_chat = st.tabs([
-    "🚀 High-Speed Redliner", 
-    "📚 Upload Cloud Precedents", 
-    "💬 Smart Chat Assistant"
+tab_review, tab_repository, tab_chat = st.tabs([
+    "💬 Word Comment Auditor", 
+    "📚 Upload Precedent Agreements", 
+    "🤖 Nemotron Chat Assistant"
 ])
 
 # ---------------------------------------------------------------------
-# TAB 1: REDLINER
+# TAB 1: WORD COMMENT REVIEWER
 # ---------------------------------------------------------------------
-with tab_redline:
-    st.header("Analyze & Redline Facility Agreement")
+with tab_review:
+    st.header("Compare Draft against Precedent Agreements")
     
-    uploaded_draft = st.file_uploader("Upload New Document (.docx)", type=["docx"], key="target_doc")
+    uploaded_draft = st.file_uploader("Upload Target Facility Agreement (.docx)", type=["docx"], key="target_doc")
     custom_instruction = st.text_area("Optional Deal Directives / Overrides", placeholder="e.g., 'Ensure minimum DSCR covenant is set to 1.25x'.")
     
-    if st.button("⚡ Fast Batch Redline Document", type="primary"):
-        if not primary_api_key:
-            st.error("Please enter your Primary Groq API Key.")
+    if st.button("🟢 Analyze with Nemotron (Generate Comments)", type="primary"):
+        if not nvidia_api_key:
+            st.error("Please enter your NVIDIA API Key.")
         elif not pinecone_api_key:
             st.error("Please enter your Pinecone API Key.")
         elif not uploaded_draft:
@@ -404,7 +388,7 @@ with tab_redline:
             logs = []
 
             # STEP 1: Pinecone Cloud Vector Search
-            logs.append(f"[{time.strftime('%H:%M:%S')}] ☁️ Querying Pinecone Serverless Cloud Database...")
+            logs.append(f"[{time.strftime('%H:%M:%S')}] ☁️ Querying Pinecone Database for Precedents...")
             log_area.text("\n".join(logs))
             
             vec_start = time.time()
@@ -422,24 +406,22 @@ with tab_redline:
             vec_elapsed = round(time.time() - vec_start, 2)
             
             progress_bar.progress(20)
-            logs.append(f"[{time.strftime('%H:%M:%S')}] ✅ Pinecone cloud lookup finished in {vec_elapsed}s! Starting LLM analysis...")
+            logs.append(f"[{time.strftime('%H:%M:%S')}] ✅ Precedents fetched in {vec_elapsed}s! Starting NVIDIA Nemotron evaluation...")
             log_area.text("\n".join(logs[-12:]))
 
-            # STEP 2: Batched LLM Analysis
-            BATCH_SIZE = 12
-            redline_results = []
+            # STEP 2: Batched LLM Analysis via Nemotron
+            BATCH_SIZE = 8
+            comment_results = []
             total_items = len(prepared_items)
             
             for i in range(0, total_items, BATCH_SIZE):
                 batch = prepared_items[i : i + BATCH_SIZE]
                 current_c = min(i + BATCH_SIZE, total_items)
                 
-                batch_evals = analyze_clause_batch(
+                batch_evals = analyze_clause_batch_nemotron(
                     batch_items=batch, 
                     custom_instruction=custom_instruction, 
-                    primary_key=primary_api_key, 
-                    secondary_key=secondary_api_key, 
-                    model_strategy=selected_model_mode
+                    nvidia_api_key=nvidia_api_key
                 )
                 
                 eval_map = {res["id"]: res for res in batch_evals}
@@ -450,32 +432,32 @@ with tab_redline:
                         "explanation": "Matches repository precedent position."
                     })
                     
-                    redline_results.append((
+                    comment_results.append((
                         item["clause"],
                         res.get("proposed_text", item["clause"]),
                         res.get("explanation", "Matches repository precedent position."),
                         res.get("is_acceptable", True)
                     ))
                 
-                time.sleep(0.3)  # Small pacing delay for RPM rate limits
+                time.sleep(0.2)
                 
                 pct = 20 + int((current_c / total_items) * 80)
                 progress_bar.progress(pct)
-                status_placeholder.text(f"Analyzed {current_c}/{total_items} clauses ({pct}%)...")
+                status_placeholder.text(f"Evaluated {current_c}/{total_items} clauses with Nemotron ({pct}%)...")
                 
-                log_msg = f"[{time.strftime('%H:%M:%S')}] ✅ Processed Clauses {i+1} to {current_c} of {total_items} ({pct}%)"
+                log_msg = f"[{time.strftime('%H:%M:%S')}] ✅ Nemotron evaluated Clauses {i+1} to {current_c} of {total_items} ({pct}%)"
                 logs.append(log_msg)
                 log_area.text("\n".join(logs[-12:]))
             
             elapsed = round(time.time() - start_time, 2)
-            st.success(f"⚡ Completed redlining in {elapsed} seconds!")
+            st.success(f"⚡ Completed document review in {elapsed} seconds!")
             
-            output_docx = create_redlined_docx(redline_results)
+            output_docx = create_commented_docx(comment_results)
             with open(output_docx, "rb") as file_data:
                 st.download_button(
-                    label="📥 Download Redlined Document (.docx)",
+                    label="📥 Download Agreement with Word Comments (.docx)",
                     data=file_data,
-                    file_name="Redlined_Facility_Agreement.docx",
+                    file_name="Facility_Agreement_Nemotron_Comments.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 )
 
@@ -483,8 +465,8 @@ with tab_redline:
 # TAB 2: CLOUD REPOSITORY INDEXING
 # ---------------------------------------------------------------------
 with tab_repository:
-    st.header("Upload Precedent Facility Agreements to DB")
-    precedent_files = st.file_uploader("Upload Agreements (.docx)", type=["docx"], accept_multiple_files=True)
+    st.header("Upload Precedent Facility Agreements to Cloud")
+    precedent_files = st.file_uploader("Upload Loan Agreements (.docx)", type=["docx"], accept_multiple_files=True)
     
     if precedent_files and st.button("☁️ Save to Pinecone Cloud"):
         if not pinecone_api_key or not pc_client:
@@ -505,7 +487,7 @@ with tab_repository:
                 if total_paras == 0:
                     continue
                 
-                batch_size = 10  # Kept small to stay safely below Pinecone 2MB limit
+                batch_size = 10
                 clean_fname = re.sub(r'[^a-zA-Z0-9_]', '_', file.name)
                 
                 for i in range(0, total_paras, batch_size):
@@ -523,8 +505,6 @@ with tab_repository:
                         vectors_to_upsert = []
                         for j, (text, emb) in enumerate(zip(chunk, embeddings)):
                             v_id = f"{clean_fname}_p{i+j}_{int(time.time()*1000)}"
-                            
-                            # Trim text if clause is unusually large
                             metadata_text = text[:1500] if len(text) > 1500 else text
                             
                             vectors_to_upsert.append({
@@ -537,7 +517,7 @@ with tab_repository:
                                 }
                             })
                         
-                        # 3. Upsert to Pinecone Cloud
+                        # 3. Upsert to Pinecone
                         pc_index.upsert(vectors=vectors_to_upsert)
                         total_indexed += len(chunk)
                         
@@ -564,21 +544,20 @@ with tab_repository:
 # TAB 3: CHAT ASSISTANT
 # ---------------------------------------------------------------------
 with tab_chat:
-    st.header("Project Finance - TBajaj Assist")
+    st.header("NVIDIA Nemotron Contract Chat Assistant")
     
     if "chat_messages" not in st.session_state:
         st.session_state.chat_messages = [
-            {"role": "assistant", "content": "Ask me any question regarding your cloud repository precedents."}
+            {"role": "assistant", "content": "Ask me any question regarding your precedent loan agreements in Pinecone."}
         ]
     
     for msg in st.session_state.chat_messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             
-    if user_query := st.chat_input("Ask a question..."):
-        active_key = primary_api_key or secondary_api_key
-        if not active_key or not pc_client:
-            st.error("Please ensure Groq and Pinecone API Keys are provided.")
+    if user_query := st.chat_input("Ask a question about precedent clauses..."):
+        if not nvidia_api_key or not pc_client:
+            st.error("Please ensure NVIDIA and Pinecone API Keys are provided.")
         else:
             st.session_state.chat_messages.append({"role": "user", "content": user_query})
             with st.chat_message("user"):
@@ -609,25 +588,27 @@ with tab_chat:
                 print(f"Chat Context Search Error: {e}", flush=True)
 
             chat_system_prompt = f"""
-            You are an expert Project Finance Legal Assistant.
+            You are NVIDIA Nemotron, an expert Legal Assistant.
             
-            1. CLOUD REPOSITORY CHECK FIRST:
-               - Examine CLOUD REPOSITORY CONTEXT.
-               - IF FOUND: Answer directly and cite the source file (e.g., "According to [Filename.docx]...").
+            1. PRECEDENT CHECK FIRST:
+               - Examine RETRIEVED CLOUD CONTEXT.
+               - IF FOUND: Answer directly and cite the source precedent file.
                  
             2. FALLBACK TO GENERAL MARKET PRACTICE:
-               - IF NOT FOUND: Begin response with:
-                 "Your uploaded cloud documents do not contain specific terms regarding this topic. However, in general project finance market practice:"
-                 Then explain general market practice.
+               - IF NOT FOUND: State that no exact precedent match was found, then explain standard market practice.
 
             RETRIEVED CLOUD CONTEXT:
             {context_str}
             """
             
-            client = Groq(api_key=active_key)
+            client = OpenAI(
+                base_url=NVIDIA_BASE_URL,
+                api_key=nvidia_api_key
+            )
+            
             try:
                 response = client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
+                    model=NVIDIA_MODEL,
                     messages=[
                         {"role": "system", "content": chat_system_prompt},
                         {"role": "user", "content": user_query}
@@ -635,16 +616,8 @@ with tab_chat:
                     temperature=0.2
                 )
                 answer = response.choices[0].message.content
-            except Exception:
-                response = client.chat.completions.create(
-                    model="llama-3.1-8b-instant",
-                    messages=[
-                        {"role": "system", "content": chat_system_prompt},
-                        {"role": "user", "content": user_query}
-                    ],
-                    temperature=0.2
-                )
-                answer = response.choices[0].message.content
+            except Exception as e:
+                answer = f"Error getting response from Nemotron: {str(e)}"
                 
             with st.chat_message("assistant"):
                 st.markdown(answer)
