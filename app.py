@@ -14,7 +14,7 @@ from pinecone import Pinecone, ServerlessSpec
 # 1. APPLICATION SETUP & PINECONE DB CONFIG
 # =====================================================================
 st.set_page_config(
-    page_title="NVIDIA AI Legal Reviewer (Strict Legal Audit)",
+    page_title="NVIDIA AI Legal Reviewer (Borrower-Friendly Review)",
     page_icon="💬",
     layout="wide",
 )
@@ -71,7 +71,7 @@ def add_redlined_comment_content(comment_paragraph, orig_text, suggested_text, e
     - Inserted text: Green text
     - Unchanged text: Standard font
     """
-    r_hdr1 = comment_paragraph.add_run("💡 REVISED CLAUSE (REDLINE):\n")
+    r_hdr1 = comment_paragraph.add_run("💡 BORROWER-FRIENDLY REDLINE:\n")
     r_hdr1.bold = True
     
     orig_words = orig_text.split()
@@ -99,14 +99,14 @@ def add_redlined_comment_content(comment_paragraph, orig_text, suggested_text, e
             ins_run.bold = True
 
     comment_paragraph.add_run("\n\n")
-    r_hdr2 = comment_paragraph.add_run("📌 PRECEDENT & REASONING:\n")
+    r_hdr2 = comment_paragraph.add_run("📌 BORROWER PROTECTION RATIONALE:\n")
     r_hdr2.bold = True
     
     r_exp = comment_paragraph.add_run(explanation)
     r_exp.font.italic = True
 
 
-def create_commented_docx(paragraph_results, author="AI Legal Reviewer"):
+def create_commented_docx(paragraph_results, author="Borrower AI Legal Counsel"):
     """
     Generates a clean DOCX where suggestions and redlined revisions are placed
     inside native MS Word sidebar balloon comment bubbles.
@@ -123,7 +123,7 @@ def create_commented_docx(paragraph_results, author="AI Legal Reviewer"):
                 comment = doc.add_comment(
                     runs=p.runs,
                     author=author,
-                    initials="AI"
+                    initials="BORROWER"
                 )
                 comment_p = comment.paragraphs[0]
                 add_redlined_comment_content(comment_p, orig_text, suggested_text, explanation)
@@ -136,16 +136,16 @@ def create_commented_docx(paragraph_results, author="AI Legal Reviewer"):
                 p_sub.paragraph_format.left_indent = Inches(0.3)
                 add_redlined_comment_content(p_sub, orig_text, suggested_text, explanation)
 
-    output_path = "Reviewed_Facility_Agreement_Comments.docx"
+    output_path = "Borrower_Friendly_Facility_Agreement_Comments.docx"
     doc.save(output_path)
     return output_path
 
 # =====================================================================
-# 3. DEEP CLOUD VECTOR RETRIEVAL & HIGH-STRICTNESS LLM ENGINE
+# 3. CLOUD VECTOR RETRIEVAL & BORROWER-ADVOCATE LLM ENGINE
 # =====================================================================
 
 def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
-    """Retrieves top 5 contextual precedents per clause with lower similarity threshold for deeper context."""
+    """Retrieves top 5 contextual precedents per clause to check baseline terms."""
     try:
         embeddings = pc.inference.embed(
             model=EMBED_MODEL,
@@ -157,14 +157,14 @@ def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
         for idx, (p_text, emb) in enumerate(zip(chunk_paras, embeddings)):
             res = index.query(
                 vector=emb["values"],
-                top_k=5,  # Expanded to 5 to pull broader definition & clause context
+                top_k=5,
                 include_metadata=True
             )
             
             ctx_list = []
             if res.get("matches") and len(res["matches"]) > 0:
                 for match in res["matches"]:
-                    if match["score"] > 0.45:  # Optimized similarity threshold to prevent missing precedent chunks
+                    if match["score"] > 0.45:
                         doc_str = match["metadata"].get("text", "")
                         src = match["metadata"].get("source", "Repo")
                         ctx_list.append(f"Precedent Chunk [{src}]: \"{doc_str}\"")
@@ -247,7 +247,7 @@ def extract_json_from_text(raw_text):
 
 
 def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
-    """Strictly evaluates draft clauses against Pinecone baseline precedents and general legal/project finance principles."""
+    """Analyzes clause batches acting specifically as Borrower's Legal Counsel to maximize operational flexibility and minimize risk."""
     if not nvidia_api_key:
         st.error("❌ API Key is missing!")
         return []
@@ -259,44 +259,31 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
         max_retries=3
     )
 
-    # HIGH-STRICTNESS PROMPT ELIMINATING PASSIVE APPROVALS
+    # BORROWER-FRIENDLY REVIEW PROMPT
     system_prompt = """
-    You are a Senior Project Finance Legal Counsel conducting a STRICT COMMERCIAL & LEGAL AUDIT of draft loan document clauses.
+    You are Senior Legal Counsel representing the BORROWER in loan agreement negotiations.
 
-    YOUR OBJECTIVE: Identify every hidden financial liability, operational restriction, missing carve-out, and commercial mismatch. Do NOT be lenient.
+    YOUR OBJECTIVE: Protect the Borrower from onerous lender terms, remove strict/unreasonable restrictions, ensure broad operational headroom, and introduce standard market borrower protections.
 
-    EVALUATION METHODOLOGY (STRICT HIERARCHY):
+    BORROWER-FRIENDLY MANDATORY REVIEW RULES:
 
-    1. SOURCE A (PINECONE PRECEDENT CONTEXT - HIGHEST PRECEDENCE):
-       - Compare draft terms strictly against retrieved precedent data (e.g., Minimum DSCR 1.26x, Debt-to-Equity ratios, facility limits, cash sweep rules).
-       - ANY numerical or structural deviation from Source A MUST BE REJECTED ('is_acceptable': false).
+    1. SOURCE A (PINECONE PRECEDENT CONTEXT):
+       - Use retrieved precedent data to prevent the Lender from imposing financial ratios or fees tighter than baseline agreements (e.g., maintain DSCR caps, leverage limits, interest margins).
+       - If draft terms are harsher on the Borrower than Source A, REJECT ('is_acceptable': false) and align with the most favorable precedent term.
 
-    2. SOURCE B (PROJECT FINANCE & LEGAL RISK ANALYSIS):
-       - Evaluate against standard APLMA/LMA project finance norms and borrower protections.
-       - MANDATORILY FLAG AND REJECT ('is_acceptable': false) IF:
-         * Subjective triggers exist (e.g., "in the opinion of the Lender" instead of "certified by PMA / Banking Base Case").
-         * Cure periods are missing or inadequate for Events of Default.
-         * Payment dates shift backward ("immediately preceding Business Day") instead of forward.
-         * Definitions under-include key items (e.g., excluding equipment/BOP contracts from "Contracts", or excluding quasi-equity from "Equity").
-         * Definitions over-include liabilities or assets (e.g., including "uncalled capital" in Current Assets).
+    2. SOURCE B (BORROWER LEGAL DEFENSE & RISK REDUCTION):
+       - MANDATORILY REJECT ('is_acceptable': false) AND REDLINE any clause that contains:
+         * UNILATERAL LENDER DISCRETION: Change "in the sole discretion/opinion of the Lender" to "acting reasonably in consultation with the Borrower" or "certified by the Lender's Technical Advisor / Banking Base Case".
+         * ABSENCE OF MATERIALITY QUALIFIERS: Insert "in all material respects" or "Material Adverse Effect" triggers before representation/covenant breaches.
+         * MISSING CURE PERIODS: Add mandatory cure/grace windows (e.g., "30 days after written notice" for non-payment or general covenants, "5 Business Days" for financial payments).
+         * UNFAIR PAYMENT SHIFTS: Change non-business day payment shifts from "immediately preceding Business Day" to "next succeeding Business Day".
+         * NARROW DEFINITIONS: Expand key borrower-favorable definitions (e.g., ensure "Permitted Indebtedness" includes trade credits, working capital lines, and subordinated sponsor loans; ensure "Contracts" covers all major project agreements).
+         * ABSOLUTE RESTRICTIONS: Change absolute prohibitions on asset transfers, corporate restructuring, or capex into exceptions with "prior written consent of the Lender (such consent not to be unreasonably withheld, conditioned, or delayed)".
 
-    OUTPUT REQUIREMENTS:
-    - For every rejected clause ('is_acceptable': false), you MUST provide a complete, robust redlined revision in 'proposed_text'.
-    - In 'explanation', explicitly state whether the rejection is triggered by "[Source A Mismatch]" or "[Source B Legal/Commercial Risk]" followed by the detailed rationale.
-    - DO NOT comment on purely cosmetic grammatical changes if legal outcome is 100% identical.
-    - Respond ONLY with valid JSON. No preamble or conversational text.
-
-    JSON STRUCTURE:
-    {
-      "results": [
-        {
-          "id": 1,
-          "is_acceptable": boolean,
-          "proposed_text": "string",
-          "explanation": "string"
-        }
-      ]
-    }
+    OUTPUT DIRECTIVES:
+    - For every rejected clause, propose a complete, borrower-protective redlined text in 'proposed_text'.
+    - In 'explanation', detail the borrower risk using: "[Source A Precedent Protection]" or "[Source B Borrower Protection]" followed by the rationale.
+    - Respond STRICTLY in valid JSON.
     """
     
     formatted_input = [
@@ -308,7 +295,7 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
         for item in batch_items
     ]
 
-    user_prompt = f"DEAL DIRECTIVES / OVERRIDES: {custom_instruction}\nCLAUSES TO REVIEW: {json.dumps(formatted_input)}"
+    user_prompt = f"BORROWER DEAL DIRECTIVES: {custom_instruction}\nCLAUSES TO REVIEW: {json.dumps(formatted_input)}"
 
     for attempt in range(3):
         try:
@@ -345,8 +332,8 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
 # 4. STREAMLIT UI & TABBED INTERFACE
 # =====================================================================
 
-st.title("💬 Contract AI Auditor T-Bajaj (Legal & Commercial Alignment)")
-st.caption("Substantive Strict Review backed by Pinecone Precedents & Llama 3.1 8B")
+st.title("💬 Contract AI Auditor T-Bajaj (Borrower Advocate Review)")
+st.caption("Substantive Borrower-Friendly Contract Review powered by Pinecone Precedents & NVIDIA Llama 3.1 8B")
 
 default_nvidia = st.secrets.get("NVIDIA_API_KEY", "") if "NVIDIA_API_KEY" in st.secrets else ""
 default_pinecone = st.secrets.get("PINECONE_API_KEY", "") if "PINECONE_API_KEY" in st.secrets else ""
@@ -387,19 +374,19 @@ tab_review, tab_repository, tab_chat = st.tabs([
 ])
 
 # ---------------------------------------------------------------------
-# TAB 1: WORD COMMENT REVIEWER
+# TAB 1: WORD COMMENT REVIEWER (BORROWER OPTIMIZED)
 # ---------------------------------------------------------------------
 with tab_review:
-    st.header("Compare Draft against Precedent Agreements - TBajaj")
+    st.header("Review Draft Facility Agreement (Borrower Perspective) - TBajaj")
     
     uploaded_draft = st.file_uploader("Upload Target Facility Agreement (.docx)", type=["docx"], key="target_doc")
     custom_instruction = st.text_area(
-        "Optional Deal Directives / Overrides", 
-        value="Audit with maximum strictness. Enforce Minimum DSCR, Debt-to-Equity, convert subjective 'Lender opinion' triggers to objective PMA standards, fix non-business day payment shifts, and ensure all definition scope gaps (e.g., Contracts, Current Assets, DSR BG rights) are redlined.",
-        placeholder="e.g., 'Ensure minimum DSCR covenant is set to 1.26x'."
+        "Optional Borrower Deal Directives / Overrides", 
+        value="Maximize borrower flexibility. Introduce 30-day cure periods for covenant defaults, add materiality thresholds, change 'sole discretion of Lender' to 'acting reasonably', shift non-business day payments to the next business day, and carve out working capital / trade debt under Permitted Indebtedness.",
+        placeholder="e.g., 'Ensure minimum DSCR is negotiable and cure periods are added to all default clauses.'"
     )
     
-    if st.button("💬 Analyze Contract (Generate Substantive Comments)", type="primary"):
+    if st.button("💬 Analyze Contract (Generate Borrower-Friendly Redlines)", type="primary"):
         if not nvidia_api_key:
             st.error("Please enter your NVIDIA API Key.")
         elif not pinecone_api_key:
@@ -438,10 +425,10 @@ with tab_review:
             vec_elapsed = round(time.time() - vec_start, 2)
             
             progress_bar.progress(20)
-            logs.append(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Precedents retrieved in {vec_elapsed}s! Evaluating via Dual-Layer Strict Engine...")
+            logs.append(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Precedents retrieved in {vec_elapsed}s! Evaluating via Borrower-Advocate Engine...")
             log_area.text("\n".join(logs[-12:]))
 
-            # STEP 2: LLM Strict Dual-Layer Evaluation
+            # STEP 2: LLM Borrower-Friendly Evaluation
             comment_results = []
             total_items = len(prepared_items)
             
@@ -479,14 +466,14 @@ with tab_review:
                 log_area.text("\n".join(logs[-12:]))
             
             elapsed = round(time.time() - start_time, 2)
-            st.success(f"⚡ Completed document review in {elapsed} seconds!")
+            st.success(f"⚡ Completed borrower review in {elapsed} seconds!")
             
             output_docx = create_commented_docx(comment_results)
             with open(output_docx, "rb") as file_data:
                 st.download_button(
-                    label="📥 Download File with Margin Comment Bubbles (.docx)",
+                    label="📥 Download File with Borrower Redlines & Comments (.docx)",
                     data=file_data,
-                    file_name="Facility_Agreement_Material_Comments.docx",
+                    file_name="Borrower_Friendly_Facility_Agreement_Comments.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 )
 
@@ -570,11 +557,11 @@ with tab_repository:
 # TAB 3: CHAT ASSISTANT
 # ---------------------------------------------------------------------
 with tab_chat:
-    st.header("Contract Chat Assistant")
+    st.header("Borrower Contract Chat Assistant")
     
     if "chat_messages" not in st.session_state:
         st.session_state.chat_messages = [
-            {"role": "assistant", "content": "Ask me any question regarding your precedent loan agreements or project finance legal principles."}
+            {"role": "assistant", "content": "Ask me any question regarding borrower-friendly negotiation strategies, precedent loan terms, or project finance risk management."}
         ]
     
     for msg in st.session_state.chat_messages:
@@ -614,15 +601,14 @@ with tab_chat:
                 print(f"[DEBUG] Chat Error: {e}", flush=True)
 
             chat_system_prompt = f"""
-            You are a Senior Project Finance Legal Advisor.
+            You are a Senior Project Finance Legal Advisor representing the BORROWER.
             
             DUAL-LAYER RESPONSE GUIDELINES:
             1. CHECK PINECONE RETRIEVED CONTEXT FIRST:
-               - If the query relates to specific values, baseline terms, or definitions stored in your Pinecone Cloud database, explicitly cite the source file and explain the precedent term.
+               - If the query relates to specific baseline terms or definitions stored in your Pinecone Cloud database, explain how to negotiate or maintain those terms to protect the Borrower.
                  
-            2. APPLY GENERAL PROJECT FINANCE / LEGAL LEARNING:
-               - If Pinecone context is silent or missing, explicitly state: "No exact precedent match was found in the uploaded repository."
-               - Then, provide a comprehensive answer using general market practice, legal principles, and standard LMA/APLMA loan documentation conventions.
+            2. APPLY BORROWER-ADVOCATE LEGAL PRINCIPLES:
+               - Provide strategic recommendations on adding cure windows, softening strict covenants, eliminating sole lender discretion, and adding standard borrower carve-outs.
 
             RETRIEVED PINECONE CLOUD CONTEXT:
             {context_str}
