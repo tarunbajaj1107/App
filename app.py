@@ -2,11 +2,8 @@ import json
 import os
 import re
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from docx import Document
-from docx.oxml import OxmlElement, parse_xml
-from docx.oxml.ns import nsdecls, qn
 from openai import OpenAI
 import streamlit as st
 from pinecone import Pinecone, ServerlessSpec
@@ -62,86 +59,53 @@ def extract_paragraphs_from_docx(docx_file):
             paragraphs.append(text)
     return paragraphs
 
-def add_native_comment(p, author, comment_text, comment_id):
-    """
-    Appends native MS Word comment XML elements to a paragraph.
-    """
-    # 1. Create or access comments.xml part
-    part = p.part
-    try:
-        comments_part = part.package.parts[qn('w:comments')]
-    except KeyError:
-        # Create comments part if it doesn't exist
-        comments_xml = OxmlElement('w:comments')
-        comments_part = part.package.relate_to(
-            comments_xml,
-            'http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments'
-        )
-
-    # 2. Add comment element
-    comment_elem = OxmlElement('w:comment')
-    comment_elem.set(qn('w:id'), str(comment_id))
-    comment_elem.set(qn('w:author'), author)
-    comment_elem.set(qn('w:date'), time.strftime("%Y-%m-%dT%H:%M:%SZ"))
-
-    p_elem = OxmlElement('w:p')
-    r_elem = OxmlElement('w:r')
-    t_elem = OxmlElement('w:t')
-    t_elem.text = comment_text
-    r_elem.append(t_elem)
-    p_elem.append(r_elem)
-    comment_elem.append(p_elem)
-
-    # Attach to root comments node
-    comments_part._element.append(comment_elem)
-
-    # 3. Wrap paragraph runs with Comment Range Start & End
-    comment_range_start = OxmlElement('w:commentRangeStart')
-    comment_range_start.set(qn('w:id'), str(comment_id))
-    
-    comment_range_end = OxmlElement('w:commentRangeEnd')
-    comment_range_end.set(qn('w:id'), str(comment_id))
-
-    comment_reference = OxmlElement('w:commentReference')
-    comment_reference.set(qn('w:id'), str(comment_id))
-
-    r_ref = OxmlElement('w:r')
-    r_ref.append(comment_reference)
-
-    p._p.insert(0, comment_range_start)
-    p._p.append(comment_range_end)
-    p._p.append(r_ref)
-
 
 def create_commented_docx(paragraph_results, author="NVIDIA Nemotron Legal AI"):
     """
     Generates a clean DOCX where suggestions and explanations are placed
-    in Word comments attached to paragraphs instead of inline track changes.
+    in native Word comments attached to paragraphs.
+    Includes a fail-safe inline callout if the environment blocks comment relations.
     """
     doc = Document()
-    comment_counter = 0
 
     for orig_text, suggested_text, explanation, is_acceptable in paragraph_results:
         p = doc.add_paragraph(orig_text)
 
         if not is_acceptable and orig_text != suggested_text:
-            comment_counter += 1
             full_comment_body = (
                 f"💡 SUGGESTION / REVISION:\n\"{suggested_text}\"\n\n"
                 f"📌 REASON & PRECEDENT:\n{explanation}"
             )
+            
+            comment_added = False
+            
+            # Method A: Standard python-docx native comment API
             try:
-                add_native_comment(p, author, full_comment_body, comment_counter)
+                if hasattr(p, "add_comment"):
+                    p.add_comment(text=full_comment_body, author=author, initials="AI")
+                    comment_added = True
             except Exception as e:
-                # Fallback to inline callout box if Word XML manipulation encounters a edge case
+                print(f"Native comment insertion notice: {e}", flush=True)
+
+            # Method B: Fail-safe formatted callout box inside document
+            if not comment_added:
                 p_sub = doc.add_paragraph()
-                r = p_sub.add_run(f"💬 [Comment Suggestion]: {full_comment_body}")
-                r.font.italic = True
-                r.font.size = 10
+                p_sub.paragraph_format.left_indent = docx_shared_indent(0.25)
+                run_tag = p_sub.add_run(f"💬 [NVIDIA AI Legal Review Note]:\n")
+                run_tag.bold = True
+                
+                run_body = p_sub.add_run(full_comment_body)
+                run_body.font.italic = True
+                run_body.font.size = 100000  # standard ~10pt
 
     output_path = "Reviewed_Facility_Agreement_Comments.docx"
     doc.save(output_path)
     return output_path
+
+
+def docx_shared_indent(inches):
+    from docx.shared import Inches
+    return Inches(inches)
 
 # =====================================================================
 # 3. CLOUD VECTOR RETRIEVAL & NEMOTRON LLM ENGINE
@@ -307,9 +271,9 @@ def analyze_clause_batch_nemotron(batch_items, custom_instruction, nvidia_api_ke
     for item in batch_items:
         fallback_results.append({
             "id": item["id"],
-            "is_acceptable": True,
+            "is_acceptable": False,
             "proposed_text": item["clause"],
-            "explanation": "Skipped due to API connection timeouts."
+            "explanation": "Flagged for manual review due to API timeout."
         })
     return fallback_results
 
@@ -494,14 +458,12 @@ with tab_repository:
                     chunk = paragraphs[i : i + batch_size]
                     
                     try:
-                        # 1. Embed via Pinecone Hosted Inference
                         embeddings = pc_client.inference.embed(
                             model=EMBED_MODEL,
                             inputs=chunk,
                             parameters={"input_type": "passage"}
                         )
                         
-                        # 2. Structure Vectors safely
                         vectors_to_upsert = []
                         for j, (text, emb) in enumerate(zip(chunk, embeddings)):
                             v_id = f"{clean_fname}_p{i+j}_{int(time.time()*1000)}"
@@ -517,7 +479,6 @@ with tab_repository:
                                 }
                             })
                         
-                        # 3. Upsert to Pinecone
                         pc_index.upsert(vectors=vectors_to_upsert)
                         total_indexed += len(chunk)
                         
