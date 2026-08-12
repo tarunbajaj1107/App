@@ -14,7 +14,7 @@ from pinecone import Pinecone, ServerlessSpec
 # 1. APPLICATION SETUP & PINECONE DB CONFIG
 # =====================================================================
 st.set_page_config(
-    page_title="NVIDIA AI Legal Reviewer (Borrower-Friendly Review)",
+    page_title="NVIDIA AI Legal Reviewer (Balanced Borrower Review)",
     page_icon="💬",
     layout="wide",
 )
@@ -247,7 +247,7 @@ def extract_json_from_text(raw_text):
 
 
 def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
-    """Analyzes clause batches acting specifically as Borrower's Legal Counsel to maximize operational flexibility and minimize risk."""
+    """Analyzes clause batches acting as practical Borrower's Counsel using sound legal judgment and commercial common sense."""
     if not nvidia_api_key:
         st.error("❌ API Key is missing!")
         return []
@@ -262,32 +262,27 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
     system_prompt = """
     You are Senior Legal Counsel representing the BORROWER in loan agreement negotiations.
 
-    YOUR OBJECTIVE: Protect the Borrower from onerous lender terms, remove strict/unreasonable restrictions, ensure broad operational headroom, and introduce standard market borrower protections.
+    YOUR OBJECTIVE: Exercise sound commercial legal judgment. Protect the Borrower from genuinely onerous terms, rigid operational defaults, and unfair lender discretion, WITHOUT over-redlining standard market boilerplate or reasonable mechanical terms.
 
-    BORROWER-FRIENDLY MANDATORY REVIEW RULES:
-
-    1. SOURCE A (PINECONE PRECEDENT CONTEXT):
-       - Use retrieved precedent data to prevent the Lender from imposing financial ratios or fees tighter than baseline agreements (e.g., maintain DSCR caps, leverage limits, interest margins).
-       - If draft terms are harsher on the Borrower than Source A, REJECT ('is_acceptable': false) and align with the most favorable precedent term.
-
-    2. SOURCE B (BORROWER LEGAL DEFENSE & RISK REDUCTION):
-       - MANDATORILY REJECT ('is_acceptable': false) AND REDLINE any clause that contains:
-         * UNILATERAL LENDER DISCRETION: Change "in the sole discretion/opinion of the Lender" to "acting reasonably in consultation with the Borrower" or "certified by the Lender's Technical Advisor / Banking Base Case".
-         * ABSENCE OF MATERIALITY QUALIFIERS: Insert "in all material respects" or "Material Adverse Effect" triggers before representation/covenant breaches.
-         * MISSING CURE PERIODS: Add mandatory cure/grace windows (e.g., "30 days after written notice" for non-payment or general covenants, "5 Business Days" for financial payments).
-         * UNFAIR PAYMENT SHIFTS: Change non-business day payment shifts from "immediately preceding Business Day" to "next succeeding Business Day".
-         * NARROW DEFINITIONS: Expand key borrower-favorable definitions (e.g., ensure "Permitted Indebtedness" includes trade credits, working capital lines, and subordinated sponsor loans; ensure "Contracts" covers all major project agreements).
-         * ABSOLUTE RESTRICTIONS: Change absolute prohibitions on asset transfers, corporate restructuring, or capex into exceptions with "prior written consent of the Lender (such consent not to be unreasonably withheld, conditioned, or delayed)".
+    COMMON-SENSE REVIEW PRINCIPLES:
+    1. DO NOT over-redline: Standard definitions, mechanical provisions (e.g., address for notices, calculation methods), or customary lender protections DO NOT need "in consultation with borrower" or "materiality" added mechanically if they are market-standard. Mark them as acceptable ('is_acceptable': true).
+    2. Focus redlines on HIGH-RISK areas:
+       - Default Triggers: Ensure Events of Default contain appropriate cure/grace periods (e.g., 30 days for general covenants, 3 to 5 business days for payment defaults) and materiality thresholds where appropriate.
+       - Subjective Discretion: If a lender has unilateral subjective approval rights (e.g., "in the sole opinion of the Lender"), change it to "acting reasonably" or an objective third-party/advisor standard.
+       - Negative Covenants: Ensure essential business operational carve-outs exist (e.g., ordinary course trade debt / working capital, permitted asset disposals, standard insurance claims).
+       - Business Day Adjustments: Shift payment dates landing on non-business days to the "next succeeding Business Day" instead of forcing earlier payment on the "preceding Business Day".
+    3. PRECEDENT ALIGNMENT (SOURCE A):
+       - If retrieved precedent shows more favorable commercial limits for the Borrower (ratios, fee caps, interest margins), maintain or align with the precedent.
 
     OUTPUT DIRECTIVES:
-    - For every rejected clause, propose a complete, borrower-protective redlined text in 'proposed_text'.
-    - In 'explanation', detail the borrower risk using: "[Source A Precedent Protection]" or "[Source B Borrower Protection]" followed by the rationale.
+    - Set 'is_acceptable': true if the clause is standard, balanced, or non-prejudicial.
+    - Set 'is_acceptable': false ONLY if the clause presents real operational, default, or financial risk to the borrower. Provide a clear, redlined 'proposed_text' and a short 'explanation'.
     - Respond STRICTLY in valid JSON using this structure:
     {
       "results": [
         {
           "id": 1,
-          "is_acceptable": false,
+          "is_acceptable": true,
           "proposed_text": "string",
           "explanation": "string"
         }
@@ -321,7 +316,6 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
             raw_content = response.choices[0].message.content
             data = extract_json_from_text(raw_content)
             
-            # Safe handling for both Array and Dict returns
             if isinstance(data, list):
                 return data
             elif isinstance(data, dict):
@@ -347,7 +341,7 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
 # =====================================================================
 
 st.title("💬 Contract AI Auditor T-Bajaj (Borrower Advocate Review)")
-st.caption("Substantive Borrower-Friendly Contract Review powered by Pinecone Precedents & NVIDIA Llama 3.1 8B")
+st.caption("Pragmatic Borrower-Friendly Contract Review powered by Pinecone Precedents & NVIDIA Llama 3.1 8B")
 
 default_nvidia = st.secrets.get("NVIDIA_API_KEY", "") if "NVIDIA_API_KEY" in st.secrets else ""
 default_pinecone = st.secrets.get("PINECONE_API_KEY", "") if "PINECONE_API_KEY" in st.secrets else ""
@@ -388,7 +382,7 @@ tab_review, tab_repository, tab_chat = st.tabs([
 ])
 
 # ---------------------------------------------------------------------
-# TAB 1: WORD COMMENT REVIEWER (BORROWER OPTIMIZED)
+# TAB 1: WORD COMMENT REVIEWER (BALANCED BORROWER OPTIMIZED)
 # ---------------------------------------------------------------------
 with tab_review:
     st.header("Review Draft Facility Agreement (Borrower Perspective) - TBajaj")
@@ -396,8 +390,8 @@ with tab_review:
     uploaded_draft = st.file_uploader("Upload Target Facility Agreement (.docx)", type=["docx"], key="target_doc")
     custom_instruction = st.text_area(
         "Optional Borrower Deal Directives / Overrides", 
-        value="Maximize borrower flexibility. Introduce 30-day cure periods for covenant defaults, add materiality thresholds, change 'sole discretion of Lender' to 'acting reasonably', shift non-business day payments to the next business day, and carve out working capital / trade debt under Permitted Indebtedness.",
-        placeholder="e.g., 'Ensure minimum DSCR is negotiable and cure periods are added to all default clauses.'"
+        value="Ensure standard borrower protections without over-redlining standard mechanics. Focus on adding reasonable cure periods to default triggers, eliminating sole lender discretion on operational approvals, and ensuring ordinary course trade debt is permitted.",
+        placeholder="e.g., 'Ensure cure periods are added to non-financial covenant defaults and avoid modifying standard definitions unnecessarily.'"
     )
     
     if st.button("💬 Analyze Contract (Generate Borrower-Friendly Redlines)", type="primary"):
@@ -622,7 +616,7 @@ with tab_chat:
                - If the query relates to specific baseline terms or definitions stored in your Pinecone Cloud database, explain how to negotiate or maintain those terms to protect the Borrower.
                  
             2. APPLY BORROWER-ADVOCATE LEGAL PRINCIPLES:
-               - Provide strategic recommendations on adding cure windows, softening strict covenants, eliminating sole lender discretion, and adding standard borrower carve-outs.
+               - Provide balanced, high-impact recommendations focusing on key borrower concerns (grace periods, sensible approval standards, working capital headroom) rather than pedantic over-redlining.
 
             RETRIEVED PINECONE CLOUD CONTEXT:
             {context_str}
