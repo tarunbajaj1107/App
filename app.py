@@ -21,10 +21,13 @@ st.set_page_config(
 
 INDEX_NAME = "project-finance-playbook"
 EMBED_MODEL = "multilingual-e5-large"
-NVIDIA_BASE_URL = "[https://integrate.api.nvidia.com/v1](https://integrate.api.nvidia.com/v1)"
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
 # Active Model Endpoint
 NVIDIA_MODEL = "meta/llama-3.1-8b-instruct"
+
+# Reduced batch size prevents HTTP socket drops/timeouts
+BATCH_SIZE = 4 
 
 @st.cache_resource
 def init_pinecone(api_key):
@@ -68,11 +71,9 @@ def add_redlined_comment_content(comment_paragraph, orig_text, suggested_text, e
     - Inserted text: Green text
     - Unchanged text: Standard font
     """
-    # Header 1: Proposed Revision
     r_hdr1 = comment_paragraph.add_run("💡 REVISED CLAUSE (REDLINE):\n")
     r_hdr1.bold = True
     
-    # Generate word-level diff opcodes
     orig_words = orig_text.split()
     sugg_words = suggested_text.split()
     matcher = difflib.SequenceMatcher(None, orig_words, sugg_words)
@@ -97,7 +98,6 @@ def add_redlined_comment_content(comment_paragraph, orig_text, suggested_text, e
             ins_run.font.color.rgb = RGBColor(34, 139, 34)  # Green
             ins_run.bold = True
 
-    # Header 2: Reason & Precedent
     comment_paragraph.add_run("\n\n")
     r_hdr2 = comment_paragraph.add_run("📌 PRECEDENT & REASON:\n")
     r_hdr2.bold = True
@@ -109,19 +109,16 @@ def add_redlined_comment_content(comment_paragraph, orig_text, suggested_text, e
 def create_commented_docx(paragraph_results, author="AI Legal Reviewer"):
     """
     Generates a clean DOCX where suggestions and redlined revisions are placed
-    inside native MS Word sidebar balloon comment bubbles attached to paragraphs.
+    inside native MS Word sidebar balloon comment bubbles.
     """
     doc = Document()
 
     for orig_text, suggested_text, explanation, is_acceptable in paragraph_results:
         p = doc.add_paragraph()
-        run = p.add_run(orig_text)  # Document main body text stays clean
+        run = p.add_run(orig_text)
 
-        # Only create a balloon comment if marked unacceptable and has a real substantive diff
         if not is_acceptable and orig_text.strip() != suggested_text.strip():
             comment_added = False
-            
-            # Method A: Native python-docx balloon comment
             try:
                 comment = doc.add_comment(
                     runs=p.runs,
@@ -134,7 +131,6 @@ def create_commented_docx(paragraph_results, author="AI Legal Reviewer"):
             except Exception as e:
                 print(f"[DEBUG] Balloon comment creation notice: {e}", flush=True)
 
-            # Method B: Fallback formatted block if doc.add_comment is unavailable
             if not comment_added:
                 p_sub = doc.add_paragraph()
                 p_sub.paragraph_format.left_indent = Inches(0.3)
@@ -187,7 +183,7 @@ def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
         } for idx, p_text in enumerate(chunk_paras)], len(chunk_paras)
 
 
-def run_parallel_pinecone_retrieval(pc, index, paragraphs, batch_size=10, max_workers=4, status_placeholder=None, progress_bar=None, log_area=None, logs_list=None):
+def run_parallel_pinecone_retrieval(pc, index, paragraphs, batch_size=5, max_workers=3, status_placeholder=None, progress_bar=None, log_area=None, logs_list=None):
     total = len(paragraphs)
     prepared_items = [None] * total
     
@@ -228,19 +224,14 @@ def run_parallel_pinecone_retrieval(pc, index, paragraphs, batch_size=10, max_wo
 
 
 def extract_json_from_text(raw_text):
-    """
-    Extracts the main JSON object from LLM responses even if extra markdown,
-    commentary, or trailing text exists.
-    """
+    """Extracts JSON payload even if LLM appends surrounding conversational text."""
     raw_text = raw_text.strip()
     
-    # Strip markdown block ticks if present
     if raw_text.startswith("```"):
         raw_text = re.sub(r"^```[a-zA-Z]*\n?", "", raw_text)
         raw_text = re.sub(r"\n?```$", "", raw_text)
         raw_text = raw_text.strip()
 
-    # Find the primary target JSON payload using outermost brace matching
     match = re.search(r"\{[\s\S]*\}", raw_text)
     if match:
         json_candidate = match.group(0)
@@ -249,35 +240,30 @@ def extract_json_from_text(raw_text):
         except json.JSONDecodeError:
             pass
 
-    # Direct fallback parsing
     return json.loads(raw_text)
 
 
 def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
-    """Analyzes clause batches using active LLM with strict materiality and robust JSON parsing."""
+    """Analyzes clause batches using active LLM with explicit connection timeouts."""
     if not nvidia_api_key:
         st.error("❌ API Key is missing!")
         return []
 
-    print(f"\n[DEBUG] Connecting to URL: {NVIDIA_BASE_URL}", flush=True)
-    print(f"[DEBUG] Attempting Model ID: {NVIDIA_MODEL}", flush=True)
-
+    # Configured with explicit timeouts to prevent connection drops
     client = OpenAI(
         base_url=NVIDIA_BASE_URL,
-        api_key=nvidia_api_key
+        api_key=nvidia_api_key,
+        timeout=120.0,  # Extended 2-minute connection timeout
+        max_retries=3
     )
 
-    # STRICT MATERIALITY & JSON-ONLY SYSTEM PROMPT
     system_prompt = """
     You are a Senior Legal Counsel evaluating contract clauses against standard precedent loan agreements.
 
     CRITICAL RULE - MATERIALITY FILTER:
     1. DO NOT comment on purely cosmetic, stylistic, grammatical, or drafting differences that DO NOT change the legal or commercial interpretation.
     2. Mark 'is_acceptable': true IF the clause carries substantially the same legal effect, rights, liabilities, or obligations as precedent, even if phrased differently.
-    3. ONLY mark 'is_acceptable': false IF there is a MATERIAL DISCREPANCY, such as:
-       - Shift in financial thresholds, ratios, cure periods, or notice periods.
-       - Alteration of legal rights, indemnities, event of default triggers, or liability caps.
-       - Violation of explicit deal directives provided.
+    3. ONLY mark 'is_acceptable': false IF there is a MATERIAL DISCREPANCY.
     4. If 'is_acceptable' is true: set 'proposed_text' to the original clause and 'explanation' to "".
 
     OUTPUT RULES:
@@ -317,24 +303,20 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
             )
             
             raw_content = response.choices[0].message.content
-            print(f"[DEBUG] Raw LLM Response Received! Length: {len(raw_content)} chars", flush=True)
-            
-            # Robust JSON Extraction
             data = extract_json_from_text(raw_content)
             return data.get("results", [])
             
         except Exception as e:
             err_msg = f"❌ [Attempt {attempt+1} Failed] Model: '{NVIDIA_MODEL}' | Error: {str(e)}"
             print(f"[DEBUG] {err_msg}", flush=True)
-            time.sleep((attempt + 1) * 2)
+            time.sleep((attempt + 1) * 3)
 
-    # Clean fallback if 3 attempts fail
     return [
         {
             "id": item["id"],
             "is_acceptable": True,
             "proposed_text": item["clause"],
-            "explanation": "Accepted by default due to output structure parsing timeout."
+            "explanation": "Accepted by default due to connection error."
         }
         for item in batch_items
     ]
@@ -356,7 +338,7 @@ with st.sidebar:
     
     st.divider()
     st.header("⚙️ Model Settings")
-    st.info(f"**Active Model:** `{NVIDIA_MODEL}`\n\n**Mode:** Strict Materiality & Robust JSON Parsing")
+    st.info(f"**Active Model:** `{NVIDIA_MODEL}`\n\n**Batch Size:** `{BATCH_SIZE} Clauses / Call`")
     
     st.divider()
     st.header("☁️ Cloud Vector Storage")
@@ -422,8 +404,8 @@ with tab_review:
                 pc=pc_client,
                 index=pc_index, 
                 paragraphs=paragraphs, 
-                batch_size=10, 
-                max_workers=4,
+                batch_size=5, 
+                max_workers=3,
                 status_placeholder=status_placeholder,
                 progress_bar=progress_bar,
                 log_area=log_area,
@@ -435,8 +417,7 @@ with tab_review:
             logs.append(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Precedents retrieved in {vec_elapsed}s! Evaluating with Llama 3.1 8B...")
             log_area.text("\n".join(logs[-12:]))
 
-            # STEP 2: LLM Evaluation
-            BATCH_SIZE = 10
+            # STEP 2: LLM Evaluation (Controlled Batches)
             comment_results = []
             total_items = len(prepared_items)
             
@@ -464,8 +445,6 @@ with tab_review:
                         res.get("explanation", ""),
                         res.get("is_acceptable", True)
                     ))
-                
-                time.sleep(0.2)
                 
                 pct = 20 + int((current_c / total_items) * 80)
                 progress_bar.progress(pct)
@@ -513,11 +492,11 @@ with tab_repository:
                 if total_paras == 0:
                     continue
                 
-                batch_size = 10
+                b_size = 10
                 clean_fname = re.sub(r'[^a-zA-Z0-9_]', '_', file.name)
                 
-                for i in range(0, total_paras, batch_size):
-                    chunk = paragraphs[i : i + batch_size]
+                for i in range(0, total_paras, b_size):
+                    chunk = paragraphs[i : i + b_size]
                     
                     try:
                         embeddings = pc_client.inference.embed(
@@ -544,7 +523,7 @@ with tab_repository:
                         pc_index.upsert(vectors=vectors_to_upsert)
                         total_indexed += len(chunk)
                         
-                        current_clause = min(i + batch_size, total_paras)
+                        current_clause = min(i + b_size, total_paras)
                         overall_pct = ((file_idx + (current_clause / total_paras)) / total_files)
                         prog_bar.progress(min(overall_pct, 1.0))
                         status_box.text(f"Uploading '{file.name}': {current_clause}/{total_paras} clauses...")
@@ -626,7 +605,8 @@ with tab_chat:
             
             client = OpenAI(
                 base_url=NVIDIA_BASE_URL,
-                api_key=nvidia_api_key
+                api_key=nvidia_api_key,
+                timeout=60.0
             )
             
             try:
