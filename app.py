@@ -12,7 +12,7 @@ from pinecone import Pinecone, ServerlessSpec
 # 1. APPLICATION SETUP & PINECONE CLOUD VECTOR DB
 # =====================================================================
 st.set_page_config(
-    page_title="NVIDIA Nemotron AI Legal Reviewer (Word Comments)",
+    page_title="Tarun NVIDIA Nemotron AI Legal Reviewer (Word Comments)",
     page_icon="🟢",
     layout="wide",
 )
