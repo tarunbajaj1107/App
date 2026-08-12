@@ -14,7 +14,7 @@ from pinecone import Pinecone, ServerlessSpec
 # 1. APPLICATION SETUP & PINECONE DB CONFIG
 # =====================================================================
 st.set_page_config(
-    page_title="NVIDIA AI Legal Reviewer (Dual-Layer Review)",
+    page_title="NVIDIA AI Legal Reviewer (Strict Legal Audit)",
     page_icon="💬",
     layout="wide",
 )
@@ -26,7 +26,7 @@ NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 # Active Model Endpoint
 NVIDIA_MODEL = "meta/llama-3.1-8b-instruct"
 
-# Small batch size keeps request payloads small and avoids connection drops
+# Batch size for LLM inference calls
 BATCH_SIZE = 4 
 
 @st.cache_resource
@@ -141,11 +141,11 @@ def create_commented_docx(paragraph_results, author="AI Legal Reviewer"):
     return output_path
 
 # =====================================================================
-# 3. CLOUD VECTOR RETRIEVAL & DUAL-LAYER LLM ENGINE
+# 3. DEEP CLOUD VECTOR RETRIEVAL & HIGH-STRICTNESS LLM ENGINE
 # =====================================================================
 
 def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
-    """Retrieves top 3 contextual precedents per clause to give the LLM deeper legal context."""
+    """Retrieves top 5 contextual precedents per clause with lower similarity threshold for deeper context."""
     try:
         embeddings = pc.inference.embed(
             model=EMBED_MODEL,
@@ -157,14 +157,14 @@ def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
         for idx, (p_text, emb) in enumerate(zip(chunk_paras, embeddings)):
             res = index.query(
                 vector=emb["values"],
-                top_k=3,
+                top_k=5,  # Expanded to 5 to pull broader definition & clause context
                 include_metadata=True
             )
             
             ctx_list = []
             if res.get("matches") and len(res["matches"]) > 0:
                 for match in res["matches"]:
-                    if match["score"] > 0.58:
+                    if match["score"] > 0.45:  # Optimized similarity threshold to prevent missing precedent chunks
                         doc_str = match["metadata"].get("text", "")
                         src = match["metadata"].get("source", "Repo")
                         ctx_list.append(f"Precedent Chunk [{src}]: \"{doc_str}\"")
@@ -247,7 +247,7 @@ def extract_json_from_text(raw_text):
 
 
 def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
-    """Analyzes clause batches using both Pinecone DB learning and LLM general legal/project finance knowledge."""
+    """Strictly evaluates draft clauses against Pinecone baseline precedents and general legal/project finance principles."""
     if not nvidia_api_key:
         st.error("❌ API Key is missing!")
         return []
@@ -259,30 +259,31 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
         max_retries=3
     )
 
-    # UPDATED DUAL-LAYER EVALUATION SYSTEM PROMPT
+    # HIGH-STRICTNESS PROMPT ELIMINATING PASSIVE APPROVALS
     system_prompt = """
-    You are a Senior Legal Counsel evaluating draft contract clauses against precedent loan agreements.
+    You are a Senior Project Finance Legal Counsel conducting a STRICT COMMERCIAL & LEGAL AUDIT of draft loan document clauses.
 
-    EVALUATION METHODOLOGY (DUAL-LAYER REVIEW):
-    You MUST cross-evaluate each draft clause using TWO SOURCES:
+    YOUR OBJECTIVE: Identify every hidden financial liability, operational restriction, missing carve-out, and commercial mismatch. Do NOT be lenient.
 
-    1. SOURCE A (PINECONE RETRIEVED CONTEXT):
-       - The specific commercial terms, numerical thresholds, financial ratios (e.g., DSCR, D/E limits, fees), and agreement definitions retrieved from the vector database.
-       - ANY numerical or structural deviation from Source A MUST be marked 'is_acceptable': false.
+    EVALUATION METHODOLOGY (STRICT HIERARCHY):
 
-    2. SOURCE B (GENERAL LEGAL & PROJECT FINANCE KNOWLEDGE):
-       - Your internal knowledge base of standard project finance market practices, legal drafting conventions, core contract principles, and liability allocations.
-       - Even if Source A is silent or missing, evaluate whether the draft term introduces unreasonable legal risk (e.g., missing cure periods, shifting payment due dates backward, vague Material Adverse Effect triggers, unhedged operational exposure).
-       - IF the terms are onerous, legally disadvantageous, or operationally hazardous compared to market standard, mark 'is_acceptable': false.
+    1. SOURCE A (PINECONE PRECEDENT CONTEXT - HIGHEST PRECEDENCE):
+       - Compare draft terms strictly against retrieved precedent data (e.g., Minimum DSCR 1.26x, Debt-to-Equity ratios, facility limits, cash sweep rules).
+       - ANY numerical or structural deviation from Source A MUST BE REJECTED ('is_acceptable': false).
 
-    INSTRUCTIONS FOR MATERIALITY REVIEW:
-    - COMMERCIAL & FINANCIAL POSITIONS: Mandatorily flag DSCR, Debt-to-Equity ratios, leverage caps, interest margins, mandatory prepayments, cash sweeps, and payment waterfalls.
-    - LEGAL RISK & LIABILITY ALLOCATIONS: Mandatorily flag Events of Default triggers, cross-default thresholds, cure periods, MAE definitions, indemnity scopes, and business-day adjustment conventions.
-    - COSMETIC FILTER: DO NOT flag purely stylistic, cosmetic, or grammatical variations if the legal and financial outcome is identical.
+    2. SOURCE B (PROJECT FINANCE & LEGAL RISK ANALYSIS):
+       - Evaluate against standard APLMA/LMA project finance norms and borrower protections.
+       - MANDATORILY FLAG AND REJECT ('is_acceptable': false) IF:
+         * Subjective triggers exist (e.g., "in the opinion of the Lender" instead of "certified by PMA / Banking Base Case").
+         * Cure periods are missing or inadequate for Events of Default.
+         * Payment dates shift backward ("immediately preceding Business Day") instead of forward.
+         * Definitions under-include key items (e.g., excluding equipment/BOP contracts from "Contracts", or excluding quasi-equity from "Equity").
+         * Definitions over-include liabilities or assets (e.g., including "uncalled capital" in Current Assets).
 
-    OUTPUT FORMAT REQUIREMENTS:
-    - If 'is_acceptable' is true: set 'proposed_text' to the original clause and 'explanation' to "".
-    - If 'is_acceptable' is false: set 'proposed_text' to the recommended redlined alignment and explain clearly in 'explanation' whether the issue stems from a conflict with Pinecone precedent data (Source A) or general legal/project finance risk (Source B).
+    OUTPUT REQUIREMENTS:
+    - For every rejected clause ('is_acceptable': false), you MUST provide a complete, robust redlined revision in 'proposed_text'.
+    - In 'explanation', explicitly state whether the rejection is triggered by "[Source A Mismatch]" or "[Source B Legal/Commercial Risk]" followed by the detailed rationale.
+    - DO NOT comment on purely cosmetic grammatical changes if legal outcome is 100% identical.
     - Respond ONLY with valid JSON. No preamble or conversational text.
 
     JSON STRUCTURE:
@@ -345,7 +346,7 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
 # =====================================================================
 
 st.title("💬 Contract AI Auditor T-Bajaj (Legal & Commercial Alignment)")
-st.caption("Substantive Dual-Layer Legal Review backed by Pinecone Precedents & NVIDIA Llama 3.1 General Legal Learning")
+st.caption("Substantive Strict Review backed by Pinecone Precedents & Llama 3.1 8B")
 
 default_nvidia = st.secrets.get("NVIDIA_API_KEY", "") if "NVIDIA_API_KEY" in st.secrets else ""
 default_pinecone = st.secrets.get("PINECONE_API_KEY", "") if "PINECONE_API_KEY" in st.secrets else ""
@@ -394,7 +395,7 @@ with tab_review:
     uploaded_draft = st.file_uploader("Upload Target Facility Agreement (.docx)", type=["docx"], key="target_doc")
     custom_instruction = st.text_area(
         "Optional Deal Directives / Overrides", 
-        value="Flag all deviations from precedent regarding financial covenants (Debt-to-Equity, DSCR), commercial terms, cure periods, and liability exposure.",
+        value="Audit with maximum strictness. Enforce Minimum DSCR, Debt-to-Equity, convert subjective 'Lender opinion' triggers to objective PMA standards, fix non-business day payment shifts, and ensure all definition scope gaps (e.g., Contracts, Current Assets, DSR BG rights) are redlined.",
         placeholder="e.g., 'Ensure minimum DSCR covenant is set to 1.26x'."
     )
     
@@ -437,10 +438,10 @@ with tab_review:
             vec_elapsed = round(time.time() - vec_start, 2)
             
             progress_bar.progress(20)
-            logs.append(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Precedents retrieved in {vec_elapsed}s! Evaluating via Dual-Layer Engine (Pinecone DB + LLM Knowledge)...")
+            logs.append(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Precedents retrieved in {vec_elapsed}s! Evaluating via Dual-Layer Strict Engine...")
             log_area.text("\n".join(logs[-12:]))
 
-            # STEP 2: LLM Dual-Layer Evaluation
+            # STEP 2: LLM Strict Dual-Layer Evaluation
             comment_results = []
             total_items = len(prepared_items)
             
@@ -566,7 +567,7 @@ with tab_repository:
             st.rerun()
 
 # ---------------------------------------------------------------------
-# TAB 3: CHAT ASSISTANT (DUAL-LAYER ENABLED)
+# TAB 3: CHAT ASSISTANT
 # ---------------------------------------------------------------------
 with tab_chat:
     st.header("Contract Chat Assistant")
@@ -602,7 +603,7 @@ with tab_chat:
                 context_blocks = []
                 if res.get("matches"):
                     for m in res["matches"]:
-                        if m["score"] > 0.6:
+                        if m["score"] > 0.45:
                             src = m["metadata"].get("source", "Unknown Document")
                             txt = m["metadata"].get("text", "")
                             context_blocks.append(f"From Precedent File [{src}]:\n\"{txt}\"")
@@ -612,7 +613,6 @@ with tab_chat:
             except Exception as e:
                 print(f"[DEBUG] Chat Error: {e}", flush=True)
 
-            # Chat Prompt explicitly enforcing dual-layer knowledge
             chat_system_prompt = f"""
             You are a Senior Project Finance Legal Advisor.
             
