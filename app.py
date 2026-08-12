@@ -2,9 +2,10 @@ import json
 import os
 import re
 import time
+import difflib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from docx import Document
-from docx.shared import Inches
+from docx.shared import Inches, RGBColor
 from openai import OpenAI
 import streamlit as st
 from pinecone import Pinecone, ServerlessSpec
@@ -22,7 +23,7 @@ INDEX_NAME = "project-finance-playbook"
 EMBED_MODEL = "multilingual-e5-large"
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
-# Model confirmed working on your account
+# Active Model Endpoint
 NVIDIA_MODEL = "meta/llama-3.1-8b-instruct"
 
 @st.cache_resource
@@ -47,7 +48,7 @@ def init_pinecone(api_key):
         return None, None
 
 # =====================================================================
-# 2. WORD DOCUMENT PARSING & NATIVE MARGIN COMMENT GENERATOR
+# 2. WORD DOCUMENT PARSING & REDLINED SIDEBAR COMMENT GENERATOR
 # =====================================================================
 
 def extract_paragraphs_from_docx(docx_file):
@@ -60,39 +61,87 @@ def extract_paragraphs_from_docx(docx_file):
     return paragraphs
 
 
+def add_redlined_comment_content(comment_paragraph, orig_text, suggested_text, explanation):
+    """
+    Constructs a word-by-word redlined comparison inside the balloon comment paragraph.
+    - Deleted text: Cut in Red with Strike-through
+    - Inserted text: Green text
+    - Unchanged text: Standard font
+    """
+    # Header 1: Proposed Revision
+    r_hdr1 = comment_paragraph.add_run("💡 REVISED CLAUSE (REDLINE):\n")
+    r_hdr1.bold = True
+    
+    # Generate word-level diff opcodes
+    orig_words = orig_text.split()
+    sugg_words = suggested_text.split()
+    matcher = difflib.SequenceMatcher(None, orig_words, sugg_words)
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            comment_paragraph.add_run(" ".join(orig_words[i1:i2]) + " ")
+        elif tag == 'delete':
+            # Cut in RED with strikethrough
+            del_run = comment_paragraph.add_run(" ".join(orig_words[i1:i2]) + " ")
+            del_run.font.strike = True
+            del_run.font.color.rgb = RGBColor(218, 41, 28)  # Red
+        elif tag == 'insert':
+            # Inserted in GREEN
+            ins_run = comment_paragraph.add_run(" ".join(sugg_words[j1:j2]) + " ")
+            ins_run.font.color.rgb = RGBColor(34, 139, 34)  # Green
+            ins_run.bold = True
+        elif tag == 'replace':
+            # Delete old words in RED
+            del_run = comment_paragraph.add_run(" ".join(orig_words[i1:i2]) + " ")
+            del_run.font.strike = True
+            del_run.font.color.rgb = RGBColor(218, 41, 28)  # Red
+            
+            # Insert new words in GREEN
+            ins_run = comment_paragraph.add_run(" ".join(sugg_words[j1:j2]) + " ")
+            ins_run.font.color.rgb = RGBColor(34, 139, 34)  # Green
+            ins_run.bold = True
+
+    # Header 2: Reason & Precedent
+    comment_paragraph.add_run("\n\n")
+    r_hdr2 = comment_paragraph.add_run("📌 PRECEDENT & REASON:\n")
+    r_hdr2.bold = True
+    
+    r_exp = comment_paragraph.add_run(explanation)
+    r_exp.font.italic = True
+
+
 def create_commented_docx(paragraph_results, author="AI Legal Reviewer"):
     """
-    Generates a clean DOCX where suggestions and reasons are anchored as
-    native MS Word sidebar comment bubbles attached to the paragraph runs.
+    Generates a clean DOCX where suggestions and redlined revisions are placed
+    inside native MS Word sidebar balloon comment bubbles attached to paragraphs.
     """
     doc = Document()
 
     for orig_text, suggested_text, explanation, is_acceptable in paragraph_results:
         p = doc.add_paragraph()
-        run = p.add_run(orig_text)  # Document text remains completely clean
+        run = p.add_run(orig_text)  # Document main body text stays clean
 
         if not is_acceptable and orig_text != suggested_text:
-            full_comment_body = (
-                f"💡 SUGGESTED REVISION:\n\"{suggested_text}\"\n\n"
-                f"📌 PRECEDENT & REASON:\n{explanation}"
-            )
+            comment_added = False
             
-            # Native python-docx (v1.2.0+) sidebar comment bubble insertion
+            # Method A: Native python-docx balloon comment
             try:
-                doc.add_comment(
+                comment = doc.add_comment(
                     runs=p.runs,
-                    text=full_comment_body,
                     author=author,
                     initials="AI"
                 )
-            except AttributeError:
-                # Fallback if library version is below 1.2.0
+                comment_p = comment.paragraphs[0]
+                add_redlined_comment_content(comment_p, orig_text, suggested_text, explanation)
+                comment_added = True
+            except Exception as e:
+                print(f"[DEBUG] Balloon comment creation notice: {e}", flush=True)
+
+            # Method B: Fallback formatted block if doc.add_comment is unavailable
+            if not comment_added:
                 p_sub = doc.add_paragraph()
                 p_sub.paragraph_format.left_indent = Inches(0.3)
-                r_tag = p_sub.add_run("💬 [AI Review Comment]: ")
-                r_tag.bold = True
-                r_body = p_sub.add_run(full_comment_body)
-                r_body.font.italic = True
+                add_redlined_comment_content(p_sub, orig_text, suggested_text, explanation)
 
     output_path = "Reviewed_Facility_Agreement_Comments.docx"
     doc.save(output_path)
@@ -133,7 +182,7 @@ def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
             })
         return batch_results, len(chunk_paras)
     except Exception as e:
-        print(f"❌ Pinecone Query Error: {e}", flush=True)
+        print(f"[DEBUG] ❌ Pinecone Query Error: {e}", flush=True)
         return [{
             "id": chunk_start_idx + idx,
             "clause": p_text,
@@ -182,10 +231,13 @@ def run_parallel_pinecone_retrieval(pc, index, paragraphs, batch_size=10, max_wo
 
 
 def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
-    """Analyzes clause batches using meta/llama-3.1-8b-instruct via OpenAI SDK."""
+    """Analyzes clause batches using active LLM with explicit DEBUG output."""
     if not nvidia_api_key:
         st.error("❌ API Key is missing!")
         return []
+
+    print(f"\n[DEBUG] Connecting to URL: {NVIDIA_BASE_URL}", flush=True)
+    print(f"[DEBUG] Attempting Model ID: {NVIDIA_MODEL}", flush=True)
 
     client = OpenAI(
         base_url=NVIDIA_BASE_URL,
@@ -222,6 +274,7 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
 
     for attempt in range(3):
         try:
+            print(f"[DEBUG] Sending LLM Request (Attempt {attempt+1})...", flush=True)
             response = client.chat.completions.create(
                 model=NVIDIA_MODEL,
                 messages=[
@@ -232,6 +285,7 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
             )
             
             raw_content = response.choices[0].message.content
+            print(f"[DEBUG] Raw LLM Response Received! Character Length: {len(raw_content)}", flush=True)
             
             if raw_content.startswith("```"):
                 raw_content = re.sub(r"^```[a-zA-Z]*\n", "", raw_content)
@@ -241,7 +295,9 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
             return data.get("results", [])
             
         except Exception as e:
-            print(f"[DEBUG] Attempt {attempt+1} Failed: {str(e)}", flush=True)
+            err_msg = f"❌ [Attempt {attempt+1} Failed] Model: '{NVIDIA_MODEL}' | Error: {str(e)}"
+            print(f"[DEBUG] {err_msg}", flush=True)
+            st.warning(f"⚠️ Debug Info:\n- Model: `{NVIDIA_MODEL}`\n- Error: `{str(e)}`")
             time.sleep((attempt + 1) * 2)
 
     return [
@@ -258,8 +314,8 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
 # 4. STREAMLIT UI & TABBED INTERFACE
 # =====================================================================
 
-st.title("💬 Legal Contract AI Auditor (Word Bubble Comments)")
-st.caption("Automated Legal Review with Sidebar Comments backed by Pinecone & NVIDIA Llama 3.1 8B")
+st.title("💬 Legal Contract AI Auditor (Redlined Balloon Comments)")
+st.caption("Automated Legal Review with Sidebar Comments & Redlines backed by Pinecone & NVIDIA Llama 3.1 8B")
 
 default_nvidia = st.secrets.get("NVIDIA_API_KEY", "") if "NVIDIA_API_KEY" in st.secrets else ""
 default_pinecone = st.secrets.get("PINECONE_API_KEY", "") if "PINECONE_API_KEY" in st.secrets else ""
@@ -271,7 +327,7 @@ with st.sidebar:
     
     st.divider()
     st.header("⚙️ Model Settings")
-    st.info(f"**Active Model:** `{NVIDIA_MODEL}`\n\n**Output:** Word Sidebar Comment Bubbles")
+    st.info(f"**Active Model:** `{NVIDIA_MODEL}`\n\n**Output:** Balloon Comments with Redlines")
     
     st.divider()
     st.header("☁️ Cloud Vector Storage")
@@ -324,12 +380,12 @@ with tab_review:
             progress_bar = st.progress(0)
             status_placeholder = st.empty()
             
-            debug_box = st.expander("🔍 Live Processing Logs", expanded=True)
+            debug_box = st.expander("🔍 Live Debug & Processing Logs", expanded=True)
             log_area = debug_box.empty()
             logs = []
 
             # STEP 1: Vector Search
-            logs.append(f"[{time.strftime('%H:%M:%S')}] ☁️ Fetching Precedents from Pinecone...")
+            logs.append(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Fetching Precedents from Pinecone...")
             log_area.text("\n".join(logs))
             
             vec_start = time.time()
@@ -347,7 +403,7 @@ with tab_review:
             vec_elapsed = round(time.time() - vec_start, 2)
             
             progress_bar.progress(20)
-            logs.append(f"[{time.strftime('%H:%M:%S')}] ✅ Precedents retrieved in {vec_elapsed}s! Evaluating with Llama 3.1 8B...")
+            logs.append(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Precedents retrieved in {vec_elapsed}s! Evaluating with Llama 3.1 8B...")
             log_area.text("\n".join(logs[-12:]))
 
             # STEP 2: LLM Evaluation
@@ -386,7 +442,7 @@ with tab_review:
                 progress_bar.progress(pct)
                 status_placeholder.text(f"Evaluated {current_c}/{total_items} clauses ({pct}%)...")
                 
-                log_msg = f"[{time.strftime('%H:%M:%S')}] ✅ Evaluated Clauses {i+1} to {current_c} of {total_items} ({pct}%)"
+                log_msg = f"[{time.strftime('%H:%M:%S')}] [DEBUG] Evaluated Clauses {i+1} to {current_c} of {total_items} ({pct}%)"
                 logs.append(log_msg)
                 log_area.text("\n".join(logs[-12:]))
             
@@ -398,7 +454,7 @@ with tab_review:
                 st.download_button(
                     label="📥 Download File with Margin Comment Bubbles (.docx)",
                     data=file_data,
-                    file_name="Facility_Agreement_Bubble_Comments.docx",
+                    file_name="Facility_Agreement_Redlined_Comments.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 )
 
@@ -464,12 +520,12 @@ with tab_repository:
                         prog_bar.progress(min(overall_pct, 1.0))
                         status_box.text(f"Uploading '{file.name}': {current_clause}/{total_paras} clauses...")
                         
-                        log_line = f"[{time.strftime('%H:%M:%S')}] Upserted to Cloud: Clauses {i+1} to {current_clause} from '{file.name}'"
+                        log_line = f"[{time.strftime('%H:%M:%S')}] [DEBUG] Upserted to Cloud: Clauses {i+1} to {current_clause} from '{file.name}'"
                         logs.append(log_line)
                         log_console.text("\n".join(logs[-12:]))
                         
                     except Exception as err:
-                        err_line = f"[{time.strftime('%H:%M:%S')}] ❌ Error upserting batch {i+1}-{i+len(chunk)}: {str(err)}"
+                        err_line = f"[{time.strftime('%H:%M:%S')}] ❌ [DEBUG] Error upserting batch {i+1}-{i+len(chunk)}: {str(err)}"
                         logs.append(err_line)
                         log_console.text("\n".join(logs[-12:]))
                         time.sleep(1)
@@ -523,7 +579,7 @@ with tab_chat:
                 if context_blocks:
                     context_str = "\n\n".join(context_blocks)
             except Exception as e:
-                print(f"Chat Error: {e}", flush=True)
+                print(f"[DEBUG] Chat Error: {e}", flush=True)
 
             chat_system_prompt = f"""
             You are an expert Legal Assistant.
