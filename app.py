@@ -14,7 +14,7 @@ from pinecone import Pinecone, ServerlessSpec
 # 1. APPLICATION SETUP & PINECONE DB CONFIG
 # =====================================================================
 st.set_page_config(
-    page_title="NVIDIA AI Legal Reviewer (Legal & Commercial Alignment)",
+    page_title="NVIDIA AI Legal Reviewer (Dual-Layer Review)",
     page_icon="💬",
     layout="wide",
 )
@@ -99,7 +99,7 @@ def add_redlined_comment_content(comment_paragraph, orig_text, suggested_text, e
             ins_run.bold = True
 
     comment_paragraph.add_run("\n\n")
-    r_hdr2 = comment_paragraph.add_run("📌 PRECEDENT & REASON:\n")
+    r_hdr2 = comment_paragraph.add_run("📌 PRECEDENT & REASONING:\n")
     r_hdr2.bold = True
     
     r_exp = comment_paragraph.add_run(explanation)
@@ -141,7 +141,7 @@ def create_commented_docx(paragraph_results, author="AI Legal Reviewer"):
     return output_path
 
 # =====================================================================
-# 3. CLOUD VECTOR RETRIEVAL & LLM ENGINE
+# 3. CLOUD VECTOR RETRIEVAL & DUAL-LAYER LLM ENGINE
 # =====================================================================
 
 def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
@@ -157,19 +157,19 @@ def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
         for idx, (p_text, emb) in enumerate(zip(chunk_paras, embeddings)):
             res = index.query(
                 vector=emb["values"],
-                top_k=3,  # Top 3 context window captures surrounding definitions and mechanics
+                top_k=3,
                 include_metadata=True
             )
             
             ctx_list = []
             if res.get("matches") and len(res["matches"]) > 0:
                 for match in res["matches"]:
-                    if match["score"] > 0.58:  # Broadened threshold to grab structural legal context
+                    if match["score"] > 0.58:
                         doc_str = match["metadata"].get("text", "")
                         src = match["metadata"].get("source", "Repo")
-                        ctx_list.append(f"Precedent [{src}]: \"{doc_str}\"")
+                        ctx_list.append(f"Precedent Chunk [{src}]: \"{doc_str}\"")
             
-            ctx = "\n".join(ctx_list) if ctx_list else "NO DIRECT REPOSITORY PRECEDENT FOUND."
+            ctx = "\n".join(ctx_list) if ctx_list else "NO DIRECT PINECONE PRECEDENT FOUND FOR THIS CLAUSE."
             
             batch_results.append({
                 "id": chunk_start_idx + idx,
@@ -182,7 +182,7 @@ def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
         return [{
             "id": chunk_start_idx + idx,
             "clause": p_text,
-            "context": "NO DIRECT REPOSITORY PRECEDENT FOUND."
+            "context": "NO DIRECT PINECONE PRECEDENT FOUND FOR THIS CLAUSE."
         } for idx, p_text in enumerate(chunk_paras)], len(chunk_paras)
 
 
@@ -247,7 +247,7 @@ def extract_json_from_text(raw_text):
 
 
 def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
-    """Analyzes clause batches against legal, commercial, and financial precedent standards."""
+    """Analyzes clause batches using both Pinecone DB learning and LLM general legal/project finance knowledge."""
     if not nvidia_api_key:
         st.error("❌ API Key is missing!")
         return []
@@ -255,33 +255,35 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
     client = OpenAI(
         base_url=NVIDIA_BASE_URL,
         api_key=nvidia_api_key,
-        timeout=120.0,  # Extended 2-minute connection timeout
+        timeout=120.0,
         max_retries=3
     )
 
+    # UPDATED DUAL-LAYER EVALUATION SYSTEM PROMPT
     system_prompt = """
-    You are a Senior Legal Counsel evaluating draft contract clauses against standard precedent loan agreements.
+    You are a Senior Legal Counsel evaluating draft contract clauses against precedent loan agreements.
 
-    CRITICAL INSTRUCTIONS FOR MATERIALITY REVIEW:
+    EVALUATION METHODOLOGY (DUAL-LAYER REVIEW):
+    You MUST cross-evaluate each draft clause using TWO SOURCES:
 
-    1. COMMERCIAL & FINANCIAL POSITIONS (FLAG MANDATORILY):
-       - Financial covenants, debt-to-equity ratios, DSCR, leverage caps, interest margins, fee structures.
-       - Mandatory prepayment events, yield protection, tax gross-up provisions, payment waterfalls, and baseline thresholds.
-       - ANY numerical or structural deviation from precedent commercial terms MUST be marked 'is_acceptable': false.
+    1. SOURCE A (PINECONE RETRIEVED CONTEXT):
+       - The specific commercial terms, numerical thresholds, financial ratios (e.g., DSCR, D/E limits, fees), and agreement definitions retrieved from the vector database.
+       - ANY numerical or structural deviation from Source A MUST be marked 'is_acceptable': false.
 
-    2. LEGAL RISK & LIABILITY ALLOCATIONS (FLAG MANDATORILY):
-       - Events of Default (EoD) triggers, cross-default/cross-acceleration thresholds, cure periods (remedy windows).
-       - Material Adverse Effect (MAE/MAC) scope, indemnity horizons, representations & warranties (R&Ws) qualification standards.
-       - Transferability, assignment rights, borrower restrictions, information undertakings, and governing law/dispute terms.
-       - IF draft terms are more onerous, restrictive, ambiguous, or legally disadvantageous compared to precedent, mark 'is_acceptable': false.
+    2. SOURCE B (GENERAL LEGAL & PROJECT FINANCE KNOWLEDGE):
+       - Your internal knowledge base of standard project finance market practices, legal drafting conventions, core contract principles, and liability allocations.
+       - Even if Source A is silent or missing, evaluate whether the draft term introduces unreasonable legal risk (e.g., missing cure periods, shifting payment due dates backward, vague Material Adverse Effect triggers, unhedged operational exposure).
+       - IF the terms are onerous, legally disadvantageous, or operationally hazardous compared to market standard, mark 'is_acceptable': false.
 
-    3. COSMETIC & STYLISTIC FILTER (IGNORE):
-       - DO NOT comment on purely cosmetic, grammatical, or word-order changes if the legal, commercial, and risk outcome is functionally identical.
+    INSTRUCTIONS FOR MATERIALITY REVIEW:
+    - COMMERCIAL & FINANCIAL POSITIONS: Mandatorily flag DSCR, Debt-to-Equity ratios, leverage caps, interest margins, mandatory prepayments, cash sweeps, and payment waterfalls.
+    - LEGAL RISK & LIABILITY ALLOCATIONS: Mandatorily flag Events of Default triggers, cross-default thresholds, cure periods, MAE definitions, indemnity scopes, and business-day adjustment conventions.
+    - COSMETIC FILTER: DO NOT flag purely stylistic, cosmetic, or grammatical variations if the legal and financial outcome is identical.
 
-    4. OUTPUT REQUIREMENTS:
-       - If 'is_acceptable' is true: set 'proposed_text' to original clause and 'explanation' to "".
-       - If 'is_acceptable' is false: set 'proposed_text' to the recommended alignment with precedent, and explain the commercial/legal impact in 'explanation'.
-       - Respond ONLY with valid JSON. No conversational preamble or trailing explanation text.
+    OUTPUT FORMAT REQUIREMENTS:
+    - If 'is_acceptable' is true: set 'proposed_text' to the original clause and 'explanation' to "".
+    - If 'is_acceptable' is false: set 'proposed_text' to the recommended redlined alignment and explain clearly in 'explanation' whether the issue stems from a conflict with Pinecone precedent data (Source A) or general legal/project finance risk (Source B).
+    - Respond ONLY with valid JSON. No preamble or conversational text.
 
     JSON STRUCTURE:
     {
@@ -297,7 +299,11 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
     """
     
     formatted_input = [
-        {"id": item["id"], "clause": item["clause"], "repository_context": item["context"]}
+        {
+            "id": item["id"], 
+            "clause": item["clause"], 
+            "pinecone_repository_context_source_a": item["context"]
+        }
         for item in batch_items
     ]
 
@@ -338,8 +344,8 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
 # 4. STREAMLIT UI & TABBED INTERFACE
 # =====================================================================
 
-st.title("💬 Loan Agreement AI Audit T-Bajaj (Legal & Commercial Alignment)")
-st.caption("Substantive Legal Review with Redlined Balloon Comments backed by Pinecone & NVIDIA Llama 3.1 8B")
+st.title("💬 Contract AI Auditor T-Bajaj (Legal & Commercial Alignment)")
+st.caption("Substantive Dual-Layer Legal Review backed by Pinecone Precedents & NVIDIA Llama 3.1 General Legal Learning")
 
 default_nvidia = st.secrets.get("NVIDIA_API_KEY", "") if "NVIDIA_API_KEY" in st.secrets else ""
 default_pinecone = st.secrets.get("PINECONE_API_KEY", "") if "PINECONE_API_KEY" in st.secrets else ""
@@ -389,7 +395,7 @@ with tab_review:
     custom_instruction = st.text_area(
         "Optional Deal Directives / Overrides", 
         value="Flag all deviations from precedent regarding financial covenants (Debt-to-Equity, DSCR), commercial terms, cure periods, and liability exposure.",
-        placeholder="e.g., 'Ensure minimum DSCR covenant is set to 1.25x'."
+        placeholder="e.g., 'Ensure minimum DSCR covenant is set to 1.26x'."
     )
     
     if st.button("💬 Analyze Contract (Generate Substantive Comments)", type="primary"):
@@ -431,10 +437,10 @@ with tab_review:
             vec_elapsed = round(time.time() - vec_start, 2)
             
             progress_bar.progress(20)
-            logs.append(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Precedents retrieved in {vec_elapsed}s! Evaluating with Llama 3.1 8B...")
+            logs.append(f"[{time.strftime('%H:%M:%S')}] [DEBUG] Precedents retrieved in {vec_elapsed}s! Evaluating via Dual-Layer Engine (Pinecone DB + LLM Knowledge)...")
             log_area.text("\n".join(logs[-12:]))
 
-            # STEP 2: LLM Evaluation
+            # STEP 2: LLM Dual-Layer Evaluation
             comment_results = []
             total_items = len(prepared_items)
             
@@ -560,14 +566,14 @@ with tab_repository:
             st.rerun()
 
 # ---------------------------------------------------------------------
-# TAB 3: CHAT ASSISTANT
+# TAB 3: CHAT ASSISTANT (DUAL-LAYER ENABLED)
 # ---------------------------------------------------------------------
 with tab_chat:
     st.header("Contract Chat Assistant")
     
     if "chat_messages" not in st.session_state:
         st.session_state.chat_messages = [
-            {"role": "assistant", "content": "Ask me any question regarding your precedent loan agreements."}
+            {"role": "assistant", "content": "Ask me any question regarding your precedent loan agreements or project finance legal principles."}
         ]
     
     for msg in st.session_state.chat_messages:
@@ -582,7 +588,7 @@ with tab_chat:
             with st.chat_message("user"):
                 st.markdown(user_query)
                 
-            context_str = "NO DIRECT MATCHES FOUND IN REPOSITORY."
+            context_str = "NO DIRECT MATCHES FOUND IN PINECONE REPOSITORY."
             try:
                 emb_res = pc_client.inference.embed(
                     model=EMBED_MODEL,
@@ -606,17 +612,19 @@ with tab_chat:
             except Exception as e:
                 print(f"[DEBUG] Chat Error: {e}", flush=True)
 
+            # Chat Prompt explicitly enforcing dual-layer knowledge
             chat_system_prompt = f"""
-            You are an expert Legal Assistant.
+            You are a Senior Project Finance Legal Advisor.
             
-            1. PRECEDENT CHECK FIRST:
-               - Examine RETRIEVED CLOUD CONTEXT.
-               - IF FOUND: Answer directly and cite the source precedent file.
+            DUAL-LAYER RESPONSE GUIDELINES:
+            1. CHECK PINECONE RETRIEVED CONTEXT FIRST:
+               - If the query relates to specific values, baseline terms, or definitions stored in your Pinecone Cloud database, explicitly cite the source file and explain the precedent term.
                  
-            2. FALLBACK TO GENERAL MARKET PRACTICE:
-               - IF NOT FOUND: State that no exact precedent match was found, then explain standard market practice.
+            2. APPLY GENERAL PROJECT FINANCE / LEGAL LEARNING:
+               - If Pinecone context is silent or missing, explicitly state: "No exact precedent match was found in the uploaded repository."
+               - Then, provide a comprehensive answer using general market practice, legal principles, and standard LMA/APLMA loan documentation conventions.
 
-            RETRIEVED CLOUD CONTEXT:
+            RETRIEVED PINECONE CLOUD CONTEXT:
             {context_str}
             """
             
