@@ -4,44 +4,42 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from docx import Document
+from docx.shared import Inches
 from openai import OpenAI
 import streamlit as st
 from pinecone import Pinecone, ServerlessSpec
 
 # =====================================================================
-# 1. APPLICATION SETUP & PINECONE CLOUD VECTOR DB
+# 1. APPLICATION SETUP & PINECONE DB
 # =====================================================================
 st.set_page_config(
-    page_title="NVIDIA Nemotron AI Legal Reviewer (Word Comments)",
-    page_icon="🟢",
+    page_title="NVIDIA AI Legal Reviewer (Word Bubble Comments)",
+    page_icon="💬",
     layout="wide",
 )
 
 INDEX_NAME = "project-finance-playbook"
-EMBED_MODEL = "multilingual-e5-large"  # Pinecone hosted embedding model (1024 dims)
+EMBED_MODEL = "multilingual-e5-large"
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
-# Active Model Endpoint on NVIDIA Build API Catalog
+# Model confirmed working on your account
 NVIDIA_MODEL = "meta/llama-3.1-8b-instruct"
 
 @st.cache_resource
 def init_pinecone(api_key):
-    """Initializes Pinecone client and ensures serverless index exists with 1024 dimensions."""
+    """Initializes Pinecone client and ensures serverless index exists."""
     if not api_key:
         return None, None
     try:
         pc = Pinecone(api_key=api_key)
-        
-        # Create index if it doesn't exist
         existing_indexes = [idx.name for idx in pc.list_indexes()]
         if INDEX_NAME not in existing_indexes:
             pc.create_index(
                 name=INDEX_NAME,
-                dimension=1024,  # Exact dimension match for multilingual-e5-large
+                dimension=1024,
                 metric="cosine",
                 spec=ServerlessSpec(cloud="aws", region="us-east-1")
             )
-        
         index = pc.Index(INDEX_NAME)
         return pc, index
     except Exception as e:
@@ -49,7 +47,7 @@ def init_pinecone(api_key):
         return None, None
 
 # =====================================================================
-# 2. WORD DOCUMENT PARSING & NATIVE WORD COMMENTS GENERATOR
+# 2. WORD DOCUMENT PARSING & NATIVE MARGIN COMMENT GENERATOR
 # =====================================================================
 
 def extract_paragraphs_from_docx(docx_file):
@@ -62,58 +60,49 @@ def extract_paragraphs_from_docx(docx_file):
     return paragraphs
 
 
-def docx_shared_indent(inches):
-    from docx.shared import Inches
-    return Inches(inches)
-
-
-def create_commented_docx(paragraph_results, author="NVIDIA Nemotron Legal AI"):
+def create_commented_docx(paragraph_results, author="AI Legal Reviewer"):
     """
-    Generates a clean DOCX where suggestions and explanations are placed
-    in native Word comments attached to paragraphs.
-    Includes a fail-safe inline callout if standard comment relations fail.
+    Generates a clean DOCX where suggestions and reasons are anchored as
+    native MS Word sidebar comment bubbles attached to the paragraph runs.
     """
     doc = Document()
 
     for orig_text, suggested_text, explanation, is_acceptable in paragraph_results:
-        p = doc.add_paragraph(orig_text)
+        p = doc.add_paragraph()
+        run = p.add_run(orig_text)  # Document text remains completely clean
 
         if not is_acceptable and orig_text != suggested_text:
             full_comment_body = (
-                f"💡 SUGGESTION / REVISION:\n\"{suggested_text}\"\n\n"
-                f"📌 REASON & PRECEDENT:\n{explanation}"
+                f"💡 SUGGESTED REVISION:\n\"{suggested_text}\"\n\n"
+                f"📌 PRECEDENT & REASON:\n{explanation}"
             )
             
-            comment_added = False
-            
-            # Method A: Standard python-docx native comment API
+            # Native python-docx (v1.2.0+) sidebar comment bubble insertion
             try:
-                if hasattr(p, "add_comment"):
-                    p.add_comment(text=full_comment_body, author=author, initials="AI")
-                    comment_added = True
-            except Exception as e:
-                print(f"[DEBUG] Native comment insertion notice: {e}", flush=True)
-
-            # Method B: Fail-safe formatted callout box inside document
-            if not comment_added:
+                doc.add_comment(
+                    runs=p.runs,
+                    text=full_comment_body,
+                    author=author,
+                    initials="AI"
+                )
+            except AttributeError:
+                # Fallback if library version is below 1.2.0
                 p_sub = doc.add_paragraph()
-                p_sub.paragraph_format.left_indent = docx_shared_indent(0.25)
-                run_tag = p_sub.add_run("💬 [NVIDIA AI Legal Review Note]:\n")
-                run_tag.bold = True
-                
-                run_body = p_sub.add_run(full_comment_body)
-                run_body.font.italic = True
+                p_sub.paragraph_format.left_indent = Inches(0.3)
+                r_tag = p_sub.add_run("💬 [AI Review Comment]: ")
+                r_tag.bold = True
+                r_body = p_sub.add_run(full_comment_body)
+                r_body.font.italic = True
 
     output_path = "Reviewed_Facility_Agreement_Comments.docx"
     doc.save(output_path)
     return output_path
 
 # =====================================================================
-# 3. CLOUD VECTOR RETRIEVAL & NEMOTRON LLM ENGINE
+# 3. CLOUD VECTOR RETRIEVAL & NEMOTRON / LLAMA ENGINE
 # =====================================================================
 
 def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
-    """Generates embeddings using Pinecone Hosted Inference and queries cloud vectors."""
     try:
         embeddings = pc.inference.embed(
             model=EMBED_MODEL,
@@ -132,7 +121,7 @@ def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
             ctx = "NO DIRECT REPOSITORY PRECEDENT FOUND."
             if res.get("matches") and len(res["matches"]) > 0:
                 match = res["matches"][0]
-                if match["score"] > 0.65:  # Relevance threshold
+                if match["score"] > 0.65:
                     doc_str = match["metadata"].get("text", "")
                     src = match["metadata"].get("source", "Repo")
                     ctx = f"Precedent from [{src}]: \"{doc_str}\""
@@ -144,7 +133,7 @@ def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
             })
         return batch_results, len(chunk_paras)
     except Exception as e:
-        print(f"❌ [DEBUG] Pinecone Query Error: {e}", flush=True)
+        print(f"❌ Pinecone Query Error: {e}", flush=True)
         return [{
             "id": chunk_start_idx + idx,
             "clause": p_text,
@@ -153,7 +142,6 @@ def query_pinecone_batch(pc, index, chunk_paras, chunk_start_idx):
 
 
 def run_parallel_pinecone_retrieval(pc, index, paragraphs, batch_size=10, max_workers=4, status_placeholder=None, progress_bar=None, log_area=None, logs_list=None):
-    """Executes parallel retrieval against Pinecone Cloud DB."""
     total = len(paragraphs)
     prepared_items = [None] * total
     
@@ -183,24 +171,21 @@ def run_parallel_pinecone_retrieval(pc, index, paragraphs, batch_size=10, max_wo
             if status_placeholder and progress_bar:
                 pct = int((completed_clauses / total) * 20)
                 progress_bar.progress(pct)
-                status_placeholder.text(f"🔍 Pinecone Cloud Search: {completed_clauses}/{total} clauses ({completed_chunks}/{total_chunks} batches)...")
+                status_placeholder.text(f"🔍 Searching Precedents: {completed_clauses}/{total} clauses...")
                 
             if log_area and logs_list is not None:
-                log_msg = f"[{time.strftime('%H:%M:%S')}] ☁️ Cloud Batch {completed_chunks}/{total_chunks} retrieved ({completed_clauses}/{total} clauses)"
+                log_msg = f"[{time.strftime('%H:%M:%S')}] ☁️ Batch {completed_chunks}/{total_chunks} retrieved ({completed_clauses}/{total} clauses)"
                 logs_list.append(log_msg)
                 log_area.text("\n".join(logs_list[-12:]))
 
     return prepared_items
 
 
-def analyze_clause_batch_nemotron(batch_items, custom_instruction, nvidia_api_key):
-    """Analyzes clause batches using NVIDIA Nemotron via OpenAI SDK with explicit Debug Logging."""
+def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
+    """Analyzes clause batches using meta/llama-3.1-8b-instruct via OpenAI SDK."""
     if not nvidia_api_key:
-        st.error("❌ NVIDIA API Key is missing!")
+        st.error("❌ API Key is missing!")
         return []
-
-    print(f"\n[DEBUG] Connecting to URL: {NVIDIA_BASE_URL}", flush=True)
-    print(f"[DEBUG] Attempting Model ID: {NVIDIA_MODEL}", flush=True)
 
     client = OpenAI(
         base_url=NVIDIA_BASE_URL,
@@ -208,24 +193,14 @@ def analyze_clause_batch_nemotron(batch_items, custom_instruction, nvidia_api_ke
     )
 
     system_prompt = """
-    You are NVIDIA Nemotron, an expert Legal & Contract Analyst comparing contract clauses against precedent loan agreements.
+    You are an expert Legal & Contract Analyst comparing contract clauses against precedent loan agreements.
 
     INSTRUCTIONS FOR COMMENT-BASED REVIEW:
     - Compare each input 'clause' against 'repository_context' (Precedent Agreement).
     - If a clause is UNACCEPTABLE or strays from precedent, provide a revised wording recommendation along with a clear reason.
     - If acceptable, mark 'is_acceptable': true.
 
-    EVALUATION RULES FOR EACH ITEM:
-    1. If ACCEPTABLE or substantially equivalent in legal effect to repository context:
-       - 'is_acceptable': true
-       - 'proposed_text': EXACT ORIGINAL CLAUSE TEXT
-       - 'explanation': "Matches precedent agreement standard."
-    2. If UNACCEPTABLE / NEEDS LEGAL ADJUSTMENT:
-       - 'is_acceptable': false
-       - 'proposed_text': Clean, proposed replacement text for the clause.
-       - 'explanation': Detailed reason describing why the revision is suggested based on the precedent agreement.
-
-    YOU MUST RETURN A STRICT JSON OBJECT WITH A SINGLE KEY "results" CONTAINING AN ARRAY matching the order of input items:
+    YOU MUST RETURN A STRICT JSON OBJECT WITH A SINGLE KEY "results" CONTAINING AN ARRAY:
     {
       "results": [
         {
@@ -243,18 +218,10 @@ def analyze_clause_batch_nemotron(batch_items, custom_instruction, nvidia_api_ke
         for item in batch_items
     ]
 
-    user_prompt = f"""
-    DEAL-SPECIFIC OVERRIDE DIRECTIVE:
-    {custom_instruction if custom_instruction else "None provided. Rely on repository precedent contexts."}
-
-    CLAUSES TO ANALYZE IN BATCH:
-    {json.dumps(formatted_input, indent=2)}
-    """
+    user_prompt = f"DEAL DIRECTIVE: {custom_instruction}\nCLAUSES: {json.dumps(formatted_input)}"
 
     for attempt in range(3):
         try:
-            print(f"[DEBUG] Sending Request (Attempt {attempt+1})...", flush=True)
-            
             response = client.chat.completions.create(
                 model=NVIDIA_MODEL,
                 messages=[
@@ -265,9 +232,7 @@ def analyze_clause_batch_nemotron(batch_items, custom_instruction, nvidia_api_ke
             )
             
             raw_content = response.choices[0].message.content
-            print(f"[DEBUG] Raw Response Success! Length: {len(raw_content)} chars", flush=True)
             
-            # Remove potential markdown wrappers around JSON
             if raw_content.startswith("```"):
                 raw_content = re.sub(r"^```[a-zA-Z]*\n", "", raw_content)
                 raw_content = re.sub(r"\n```$", "", raw_content)
@@ -276,9 +241,7 @@ def analyze_clause_batch_nemotron(batch_items, custom_instruction, nvidia_api_ke
             return data.get("results", [])
             
         except Exception as e:
-            err_msg = f"❌ [Attempt {attempt+1} Failed] Model: '{NVIDIA_MODEL}' | Error: {str(e)}"
-            print(f"[DEBUG] {err_msg}", flush=True)
-            st.warning(f"⚠️ NVIDIA API Call Issue:\n- Model: `{NVIDIA_MODEL}`\n- Error: `{str(e)}`")
+            print(f"[DEBUG] Attempt {attempt+1} Failed: {str(e)}", flush=True)
             time.sleep((attempt + 1) * 2)
 
     return [
@@ -286,7 +249,7 @@ def analyze_clause_batch_nemotron(batch_items, custom_instruction, nvidia_api_ke
             "id": item["id"],
             "is_acceptable": False,
             "proposed_text": item["clause"],
-            "explanation": "Flagged for manual review due to API endpoint issue."
+            "explanation": "Flagged for manual review due to API response timeout."
         }
         for item in batch_items
     ]
@@ -295,8 +258,8 @@ def analyze_clause_batch_nemotron(batch_items, custom_instruction, nvidia_api_ke
 # 4. STREAMLIT UI & TABBED INTERFACE
 # =====================================================================
 
-st.title("🟢 NVIDIA Nemotron AI Legal Reviewer")
-st.caption("Contract Auditor backed by NVIDIA Nemotron-4 LLM & Pinecone Serverless Vector DB")
+st.title("💬 Legal Contract AI Auditor (Word Bubble Comments)")
+st.caption("Automated Legal Review with Sidebar Comments backed by Pinecone & NVIDIA Llama 3.1 8B")
 
 default_nvidia = st.secrets.get("NVIDIA_API_KEY", "") if "NVIDIA_API_KEY" in st.secrets else ""
 default_pinecone = st.secrets.get("PINECONE_API_KEY", "") if "PINECONE_API_KEY" in st.secrets else ""
@@ -308,7 +271,7 @@ with st.sidebar:
     
     st.divider()
     st.header("⚙️ Model Settings")
-    st.info(f"**LLM:** `{NVIDIA_MODEL}`\n\n**Output Mode:** Word Comments (No Redlines)")
+    st.info(f"**Active Model:** `{NVIDIA_MODEL}`\n\n**Output:** Word Sidebar Comment Bubbles")
     
     st.divider()
     st.header("☁️ Cloud Vector Storage")
@@ -331,9 +294,9 @@ with st.sidebar:
                 st.error(f"Error clearing cloud database: {e}")
 
 tab_review, tab_repository, tab_chat = st.tabs([
-    "💬 Word Comment Auditor", 
+    "💬 Sidebar Comment Reviewer", 
     "📚 Upload Precedent Agreements", 
-    "🤖 Nemotron Chat Assistant"
+    "🤖 Contract Chat Assistant"
 ])
 
 # ---------------------------------------------------------------------
@@ -345,7 +308,7 @@ with tab_review:
     uploaded_draft = st.file_uploader("Upload Target Facility Agreement (.docx)", type=["docx"], key="target_doc")
     custom_instruction = st.text_area("Optional Deal Directives / Overrides", placeholder="e.g., 'Ensure minimum DSCR covenant is set to 1.25x'.")
     
-    if st.button("🟢 Analyze with Nemotron (Generate Comments)", type="primary"):
+    if st.button("💬 Analyze Contract (Generate Sidebar Comments)", type="primary"):
         if not nvidia_api_key:
             st.error("Please enter your NVIDIA API Key.")
         elif not pinecone_api_key:
@@ -365,8 +328,8 @@ with tab_review:
             log_area = debug_box.empty()
             logs = []
 
-            # STEP 1: Pinecone Cloud Vector Search
-            logs.append(f"[{time.strftime('%H:%M:%S')}] ☁️ Querying Pinecone Database for Precedents...")
+            # STEP 1: Vector Search
+            logs.append(f"[{time.strftime('%H:%M:%S')}] ☁️ Fetching Precedents from Pinecone...")
             log_area.text("\n".join(logs))
             
             vec_start = time.time()
@@ -384,11 +347,11 @@ with tab_review:
             vec_elapsed = round(time.time() - vec_start, 2)
             
             progress_bar.progress(20)
-            logs.append(f"[{time.strftime('%H:%M:%S')}] ✅ Precedents fetched in {vec_elapsed}s! Starting NVIDIA Nemotron evaluation...")
+            logs.append(f"[{time.strftime('%H:%M:%S')}] ✅ Precedents retrieved in {vec_elapsed}s! Evaluating with Llama 3.1 8B...")
             log_area.text("\n".join(logs[-12:]))
 
-            # STEP 2: Batched LLM Analysis via Nemotron
-            BATCH_SIZE = 8
+            # STEP 2: LLM Evaluation
+            BATCH_SIZE = 10
             comment_results = []
             total_items = len(prepared_items)
             
@@ -396,7 +359,7 @@ with tab_review:
                 batch = prepared_items[i : i + BATCH_SIZE]
                 current_c = min(i + BATCH_SIZE, total_items)
                 
-                batch_evals = analyze_clause_batch_nemotron(
+                batch_evals = analyze_clause_batch_llm(
                     batch_items=batch, 
                     custom_instruction=custom_instruction, 
                     nvidia_api_key=nvidia_api_key
@@ -421,9 +384,9 @@ with tab_review:
                 
                 pct = 20 + int((current_c / total_items) * 80)
                 progress_bar.progress(pct)
-                status_placeholder.text(f"Evaluated {current_c}/{total_items} clauses with Nemotron ({pct}%)...")
+                status_placeholder.text(f"Evaluated {current_c}/{total_items} clauses ({pct}%)...")
                 
-                log_msg = f"[{time.strftime('%H:%M:%S')}] ✅ Nemotron evaluated Clauses {i+1} to {current_c} of {total_items} ({pct}%)"
+                log_msg = f"[{time.strftime('%H:%M:%S')}] ✅ Evaluated Clauses {i+1} to {current_c} of {total_items} ({pct}%)"
                 logs.append(log_msg)
                 log_area.text("\n".join(logs[-12:]))
             
@@ -433,14 +396,14 @@ with tab_review:
             output_docx = create_commented_docx(comment_results)
             with open(output_docx, "rb") as file_data:
                 st.download_button(
-                    label="📥 Download Agreement with Word Comments (.docx)",
+                    label="📥 Download File with Margin Comment Bubbles (.docx)",
                     data=file_data,
-                    file_name="Facility_Agreement_Nemotron_Comments.docx",
+                    file_name="Facility_Agreement_Bubble_Comments.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 )
 
 # ---------------------------------------------------------------------
-# TAB 2: CLOUD REPOSITORY INDEXING
+# TAB 2: REPOSITORY INDEXING
 # ---------------------------------------------------------------------
 with tab_repository:
     st.header("Upload Precedent Facility Agreements to Cloud")
@@ -511,7 +474,7 @@ with tab_repository:
                         log_console.text("\n".join(logs[-12:]))
                         time.sleep(1)
             
-            st.success(f"Successfully processed {total_indexed} clauses to Pinecone Cloud Database!")
+            st.success(f"Successfully uploaded {total_indexed} clauses to Pinecone Cloud!")
             time.sleep(1)
             st.rerun()
 
@@ -519,18 +482,18 @@ with tab_repository:
 # TAB 3: CHAT ASSISTANT
 # ---------------------------------------------------------------------
 with tab_chat:
-    st.header("NVIDIA Nemotron Contract Chat Assistant")
+    st.header("Contract Chat Assistant")
     
     if "chat_messages" not in st.session_state:
         st.session_state.chat_messages = [
-            {"role": "assistant", "content": "Ask me any question regarding your precedent loan agreements in Pinecone."}
+            {"role": "assistant", "content": "Ask me any question regarding your precedent loan agreements."}
         ]
     
     for msg in st.session_state.chat_messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             
-    if user_query := st.chat_input("Ask a question about precedent clauses..."):
+    if user_query := st.chat_input("Ask a question..."):
         if not nvidia_api_key or not pc_client:
             st.error("Please ensure NVIDIA and Pinecone API Keys are provided.")
         else:
@@ -538,7 +501,7 @@ with tab_chat:
             with st.chat_message("user"):
                 st.markdown(user_query)
                 
-            context_str = "NO DIRECT MATCHES FOUND IN CLOUD REPOSITORY."
+            context_str = "NO DIRECT MATCHES FOUND IN REPOSITORY."
             try:
                 emb_res = pc_client.inference.embed(
                     model=EMBED_MODEL,
@@ -560,10 +523,10 @@ with tab_chat:
                 if context_blocks:
                     context_str = "\n\n".join(context_blocks)
             except Exception as e:
-                print(f"[DEBUG] Chat Context Search Error: {e}", flush=True)
+                print(f"Chat Error: {e}", flush=True)
 
             chat_system_prompt = f"""
-            You are NVIDIA Nemotron, an expert Legal Assistant.
+            You are an expert Legal Assistant.
             
             1. PRECEDENT CHECK FIRST:
                - Examine RETRIEVED CLOUD CONTEXT.
@@ -592,7 +555,7 @@ with tab_chat:
                 )
                 answer = response.choices[0].message.content
             except Exception as e:
-                answer = f"Error getting response from Nemotron: {str(e)}"
+                answer = f"Error getting response: {str(e)}"
                 
             with st.chat_message("assistant"):
                 st.markdown(answer)
