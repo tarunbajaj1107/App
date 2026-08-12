@@ -338,7 +338,7 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
 # 4. STREAMLIT UI & TABBED INTERFACE
 # =====================================================================
 
-st.title("💬 Contract AI Auditor T-Bajaj (Legal & Commercial Alignment)")
+st.title("💬 Loan Agreement AI Audit T-Bajaj (Legal & Commercial Alignment)")
 st.caption("Substantive Legal Review with Redlined Balloon Comments backed by Pinecone & NVIDIA Llama 3.1 8B")
 
 default_nvidia = st.secrets.get("NVIDIA_API_KEY", "") if "NVIDIA_API_KEY" in st.secrets else ""
