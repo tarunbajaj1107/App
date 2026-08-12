@@ -21,7 +21,7 @@ st.set_page_config(
 
 INDEX_NAME = "project-finance-playbook"
 EMBED_MODEL = "multilingual-e5-large"
-NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+NVIDIA_BASE_URL = "[https://integrate.api.nvidia.com/v1](https://integrate.api.nvidia.com/v1)"
 
 # Active Model Endpoint
 NVIDIA_MODEL = "meta/llama-3.1-8b-instruct"
@@ -227,8 +227,34 @@ def run_parallel_pinecone_retrieval(pc, index, paragraphs, batch_size=10, max_wo
     return prepared_items
 
 
+def extract_json_from_text(raw_text):
+    """
+    Extracts the main JSON object from LLM responses even if extra markdown,
+    commentary, or trailing text exists.
+    """
+    raw_text = raw_text.strip()
+    
+    # Strip markdown block ticks if present
+    if raw_text.startswith("```"):
+        raw_text = re.sub(r"^```[a-zA-Z]*\n?", "", raw_text)
+        raw_text = re.sub(r"\n?```$", "", raw_text)
+        raw_text = raw_text.strip()
+
+    # Find the primary target JSON payload using outermost brace matching
+    match = re.search(r"\{[\s\S]*\}", raw_text)
+    if match:
+        json_candidate = match.group(0)
+        try:
+            return json.loads(json_candidate)
+        except json.JSONDecodeError:
+            pass
+
+    # Direct fallback parsing
+    return json.loads(raw_text)
+
+
 def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
-    """Analyzes clause batches using active LLM with strict materiality guidelines."""
+    """Analyzes clause batches using active LLM with strict materiality and robust JSON parsing."""
     if not nvidia_api_key:
         st.error("❌ API Key is missing!")
         return []
@@ -241,7 +267,7 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
         api_key=nvidia_api_key
     )
 
-    # STRICT MATERIALITY SYSTEM PROMPT
+    # STRICT MATERIALITY & JSON-ONLY SYSTEM PROMPT
     system_prompt = """
     You are a Senior Legal Counsel evaluating contract clauses against standard precedent loan agreements.
 
@@ -254,8 +280,11 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
        - Violation of explicit deal directives provided.
     4. If 'is_acceptable' is true: set 'proposed_text' to the original clause and 'explanation' to "".
 
-    OUTPUT FORMAT:
-    You MUST return a strict JSON object with a single key "results" containing an array:
+    OUTPUT RULES:
+    - Respond ONLY with a valid JSON object.
+    - DO NOT include conversational preamble or trailing explanation text.
+    
+    JSON STRUCTURE:
     {
       "results": [
         {
@@ -288,27 +317,24 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
             )
             
             raw_content = response.choices[0].message.content
-            print(f"[DEBUG] Raw LLM Response Received! Character Length: {len(raw_content)}", flush=True)
+            print(f"[DEBUG] Raw LLM Response Received! Length: {len(raw_content)} chars", flush=True)
             
-            if raw_content.startswith("```"):
-                raw_content = re.sub(r"^```[a-zA-Z]*\n", "", raw_content)
-                raw_content = re.sub(r"\n```$", "", raw_content)
-
-            data = json.loads(raw_content)
+            # Robust JSON Extraction
+            data = extract_json_from_text(raw_content)
             return data.get("results", [])
             
         except Exception as e:
             err_msg = f"❌ [Attempt {attempt+1} Failed] Model: '{NVIDIA_MODEL}' | Error: {str(e)}"
             print(f"[DEBUG] {err_msg}", flush=True)
-            st.warning(f"⚠️ Debug Info:\n- Model: `{NVIDIA_MODEL}`\n- Error: `{str(e)}`")
             time.sleep((attempt + 1) * 2)
 
+    # Clean fallback if 3 attempts fail
     return [
         {
             "id": item["id"],
             "is_acceptable": True,
             "proposed_text": item["clause"],
-            "explanation": "Accepted by default due to evaluation timeout."
+            "explanation": "Accepted by default due to output structure parsing timeout."
         }
         for item in batch_items
     ]
@@ -330,7 +356,7 @@ with st.sidebar:
     
     st.divider()
     st.header("⚙️ Model Settings")
-    st.info(f"**Active Model:** `{NVIDIA_MODEL}`\n\n**Mode:** Strict Materiality Filter Enabled")
+    st.info(f"**Active Model:** `{NVIDIA_MODEL}`\n\n**Mode:** Strict Materiality & Robust JSON Parsing")
     
     st.divider()
     st.header("☁️ Cloud Vector Storage")
