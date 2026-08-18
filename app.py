@@ -14,7 +14,7 @@ from pinecone import Pinecone, ServerlessSpec
 # 1. APPLICATION SETUP & PINECONE DB CONFIG
 # =====================================================================
 st.set_page_config(
-    page_title="NVIDIA AI Legal Reviewer (Balanced Borrower Review)",
+    page_title="Legal Reviewer (TB)",
     page_icon="💬",
     layout="wide",
 )
@@ -340,7 +340,7 @@ def analyze_clause_batch_llm(batch_items, custom_instruction, nvidia_api_key):
 # 4. STREAMLIT UI & TABBED INTERFACE
 # =====================================================================
 
-st.title("💬 Contract AI Auditor T-Bajaj (Borrower Advocate Review)")
+st.title("💬 Contract AI T-Bajaj (Review)")
 st.caption("Pragmatic Borrower-Friendly Contract Review powered by Pinecone Precedents & NVIDIA Llama 3.1 8B")
 
 default_nvidia = st.secrets.get("NVIDIA_API_KEY", "") if "NVIDIA_API_KEY" in st.secrets else ""
@@ -385,7 +385,7 @@ tab_review, tab_repository, tab_chat = st.tabs([
 # TAB 1: WORD COMMENT REVIEWER (BALANCED BORROWER OPTIMIZED)
 # ---------------------------------------------------------------------
 with tab_review:
-    st.header("Review Draft Facility Agreement (Borrower Perspective) - TBajaj")
+    st.header("Review Draft Facility Agreement - TBajaj")
     
     uploaded_draft = st.file_uploader("Upload Target Facility Agreement (.docx)", type=["docx"], key="target_doc")
     custom_instruction = st.text_area(
